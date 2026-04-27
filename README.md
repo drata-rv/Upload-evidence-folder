@@ -35,8 +35,8 @@ pip install requests
 
 Your Workspace ID is the number in the Drata URL when you're logged in:
 ```
-https://app.drata.com/workspaces/12345/...
-                                 ^^^^^
+https://app.drata.com/workspaces/1/...
+                                 ^
 ```
 
 ---
@@ -47,10 +47,10 @@ Place this script in, or run it from, the root folder that contains your evidenc
 
 ```
 evidence-root/
-  Okta/
-    Identity Provider/
-      2026/
-        04/
+  Application Name/
+    System/
+      YYYY/
+        MM/
           okta-report-april.pdf
   AWS/
     CloudTrail/
