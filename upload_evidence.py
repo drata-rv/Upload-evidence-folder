@@ -261,10 +261,14 @@ def _find_month_dir(year_dir: Path, month: int) -> Optional[Path]:
 def _control_code(app_name: str) -> str:
     """Derive the UAR control code from an app folder name.
 
-    'Active Directory' → 'UAR-ActiveDirectory'
+    Spaces are removed, then the whole string is capitalised (first letter
+    upper, rest lower) to match Drata's control naming convention.
+
+    'Active Directory' → 'UAR-Activedirectory'
+    'eMarker'          → 'UAR-Emarker'
     'Synkros'          → 'UAR-Synkros'
     """
-    return "UAR-" + app_name.replace(" ", "")
+    return "UAR-" + app_name.replace(" ", "").capitalize()
 
 
 # ── Folder scanner ────────────────────────────────────────────────────────────
