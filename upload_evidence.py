@@ -23,6 +23,7 @@ Requirements:
 """
 
 import os
+import re
 import sys
 import getpass
 import calendar
@@ -214,43 +215,127 @@ class DrataClient:
         return resp.json()
 
 
+# ── Month name resolution ─────────────────────────────────────────────────────
+
+# Covers numeric, abbreviated, and full month names including non-standard
+# abbreviations actually seen in the wild (Sept, July, June, April).
+MONTH_MAP: dict[str, int] = {
+    "1": 1,  "01": 1,  "jan": 1,  "january": 1,
+    "2": 2,  "02": 2,  "feb": 2,  "february": 2,
+    "3": 3,  "03": 3,  "mar": 3,  "march": 3,
+    "4": 4,  "04": 4,  "apr": 4,  "april": 4,
+    "5": 5,  "05": 5,  "may": 5,
+    "6": 6,  "06": 6,  "jun": 6,  "june": 6,
+    "7": 7,  "07": 7,  "jul": 7,  "july": 7,
+    "8": 8,  "08": 8,  "aug": 8,  "august": 8,
+    "9": 9,  "09": 9,  "sep": 9,  "sept": 9,  "september": 9,
+    "10": 10, "oct": 10, "october": 10,
+    "11": 11, "nov": 11, "november": 11,
+    "12": 12, "dec": 12, "december": 12,
+}
+
+def _parse_month(name: str) -> Optional[int]:
+    """Return the month number for a folder name, or None if unrecognisable."""
+    return MONTH_MAP.get(name.lower())
+
+def _is_year(name: str) -> bool:
+    """True if the folder name is a 4-digit year."""
+    return bool(re.fullmatch(r'\d{4}', name))
+
+def _find_month_dir(year_dir: Path, month: int) -> Optional[Path]:
+    """Return the child directory of year_dir whose name resolves to month."""
+    for d in year_dir.iterdir():
+        if d.is_dir() and _parse_month(d.name) == month:
+            return d
+    return None
+
+# Matches a leading date stamp like '2026.3 - ' or '2025.11 – '
+_DATE_PREFIX = re.compile(r'^\d{4}\.\d{1,2}\s*[-–]\s*')
+
+def _report_type(stem: str, app_name: str) -> str:
+    """
+    Derive a stable, human-readable report type from a file stem.
+
+    '2026.3 - Synkros - Employee Roles Listing Report' → 'Employee Roles Listing Report'
+    'Access Matrix – Synkros – DRAFT'                  → 'Access Matrix – Synkros – DRAFT'
+
+    The result is used as the middle segment of the Drata evidence label so that
+    the same report type maps to the same evidence entry every month.
+    """
+    cleaned = _DATE_PREFIX.sub("", stem).strip()
+    # Strip the app name from the front if the filename leads with it
+    cleaned = re.sub(
+        rf'^{re.escape(app_name)}\s*[-–]\s*', "", cleaned, flags=re.IGNORECASE
+    ).strip()
+    return cleaned or stem
+
+
 # ── Folder scanner ────────────────────────────────────────────────────────────
 
 def scan_folder(root: Path, year: int, month: int) -> list[tuple[str, str, Path]]:
     """
-    Yield (app_name, system_name, document_path) tuples for the given month.
+    Return (app_name, label_middle, file_path) for every document that belongs
+    to the requested month.
 
-    Expected layout:
-        <root>/<AppName>/<SystemName>/<YYYY>/<MM>/<document>
+    Handles two layouts automatically:
+
+      AppName / Year / Month / files          (no system level)
+        → one entry per file, label_middle derived from the filename
+
+      AppName / SystemName / Year / Month / file   (system level present)
+        → one entry per system, label_middle = SystemName
+
+    Month directories can be numeric ('03'), abbreviated ('Mar', 'Sept'),
+    or full names ('March', 'September').
     """
     if not root.is_dir():
         raise FileNotFoundError(f"Folder not found: {root}")
 
-    year_str  = str(year)
-    month_str = f"{month:02d}"
     hits: list[tuple[str, str, Path]] = []
 
     for app_dir in sorted(root.iterdir()):
         if not app_dir.is_dir() or app_dir.name.startswith("."):
             continue
-        for sys_dir in sorted(app_dir.iterdir()):
-            if not sys_dir.is_dir() or sys_dir.name.startswith("."):
+
+        for child in sorted(app_dir.iterdir()):
+            if not child.is_dir() or child.name.startswith("."):
                 continue
-            month_dir = sys_dir / year_str / month_str
-            if not month_dir.is_dir():
-                continue
-            docs = [
-                f for f in sorted(month_dir.iterdir())
-                if f.is_file() and not f.name.startswith(".")
-            ]
-            if not docs:
-                continue
-            if len(docs) > 1:
-                print(yellow(
-                    f"  Warning: multiple files in {month_dir}; "
-                    f"using first: {docs[0].name}"
-                ))
-            hits.append((app_dir.name, sys_dir.name, docs[0]))
+
+            if _is_year(child.name):
+                # Layout: AppName/Year/Month — no system subfolder.
+                # Upload every file in the month dir as its own evidence entry,
+                # using the cleaned filename as the differentiating label segment.
+                if int(child.name) != year:
+                    continue
+                month_dir = _find_month_dir(child, month)
+                if not month_dir:
+                    continue
+                for doc in sorted(month_dir.iterdir()):
+                    if doc.is_file() and not doc.name.startswith("."):
+                        hits.append((app_dir.name, _report_type(doc.stem, app_dir.name), doc))
+
+            else:
+                # Layout: AppName/SystemName/Year/Month — system subfolder present.
+                # The system name becomes the label middle; take the first file.
+                sys_dir = child
+                year_dir = sys_dir / str(year)
+                if not year_dir.is_dir():
+                    continue
+                month_dir = _find_month_dir(year_dir, month)
+                if not month_dir:
+                    continue
+                docs = [
+                    f for f in sorted(month_dir.iterdir())
+                    if f.is_file() and not f.name.startswith(".")
+                ]
+                if not docs:
+                    continue
+                if len(docs) > 1:
+                    print(yellow(
+                        f"  Warning: multiple files under {month_dir}; "
+                        f"using first: {docs[0].name}"
+                    ))
+                hits.append((app_dir.name, sys_dir.name, docs[0]))
 
     return hits
 
