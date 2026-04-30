@@ -345,14 +345,27 @@ def ask(label: str, default: str = "", secret: bool = False) -> str:
 def ask_month() -> tuple[int, int]:
     today = datetime.date.today()
     default = f"{today.year}-{today.month:02d}"
-    print(f"\n{bold('Month to process')} (YYYY-MM, default = current month)")
+    print(f"\n{bold('Month to process')}  (YYYY-MM or YYYY-MonthName, default = current month)")
+    print(f"  {dim('e.g.  2026-04  |  2026-Apr  |  2026-April')}")
     raw = input(f"  → ").strip() or default
+
+    # Try strict numeric YYYY-MM first
     try:
         dt = datetime.datetime.strptime(raw, "%Y-%m")
         return dt.year, dt.month
     except ValueError:
-        print(yellow(f"  Could not parse '{raw}', falling back to current month."))
-        return today.year, today.month
+        pass
+
+    # Try YYYY-<anything in MONTH_MAP> — same names the folders themselves use
+    parts = raw.split("-", 1)
+    if len(parts) == 2 and parts[0].isdigit():
+        month = _parse_month(parts[1])
+        year  = int(parts[0])
+        if month and 2000 <= year <= 2100:
+            return year, month
+
+    print(yellow(f"  Could not parse '{raw}', falling back to current month."))
+    return today.year, today.month
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
