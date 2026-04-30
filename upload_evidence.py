@@ -135,36 +135,21 @@ class DrataClient:
     # ── public methods ────────────────────────────────────────────────────────
 
     def find_user_by_email(self, email: str) -> Optional[int]:
-        """Return the personnelId for a Drata user by searching personnel by email.
+        """Return the Drata user ID for the given email address.
 
-        The /personnel/email:{email} path format returns 404 in practice, so we
-        paginate the full personnel list and match by email instead.
+        Uses GET /users/email:{email} — a direct lookup endpoint that requires
+        no pagination and is not workspace-scoped.  Drata's Evidence Library
+        API accepts ownerId as a numeric integer only, so this lookup is the
+        only way to convert an email address to a usable ID.
 
-        Drata's API requires a numeric ownerId — email strings are not accepted
-        directly — so this lookup is the only way to obtain it.
-
-        We check all known email field variants (Drata has used more than one
-        across API versions) and store any seen on the first record so we can
-        surface a useful hint if nothing matches.
+        Returns None (without raising) on 404 so the caller can offer the
+        "continue without owner" fallback.
         """
-        # All field names Drata has used for email across API versions
-        EMAIL_FIELDS = ("email", "emailAddress", "workEmail")
-
-        needle = email.lower()
-        first_record_keys: Optional[list] = None
-
-        for person in self._paginate(f"{self._base}/personnel", {"size": 500}):
-            if first_record_keys is None:
-                first_record_keys = list(person.keys())
-
-            for field in EMAIL_FIELDS:
-                candidate = (person.get(field) or "").lower()
-                if candidate == needle:
-                    return person.get("personnelId") or person.get("id")
-
-        # Attach the field names we actually saw so the caller can surface a hint
-        self._last_personnel_keys = first_record_keys or []
-        return None
+        resp = self._s.get(f"{DRATA_BASE}/users/email:{email}", timeout=30)
+        if resp.status_code == 404:
+            return None
+        self._check(resp)  # raises DrataError on any other non-2xx
+        return resp.json().get("id")
 
     def find_control_id(self, code: str) -> Optional[int]:
         """Return the numeric ID of a control by its code (e.g. 'MICS-35')."""
@@ -497,12 +482,8 @@ def main() -> None:
 
     if not owner_id:
         print(yellow("NOT FOUND"))
-        print(yellow(f"  Could not resolve '{owner_email}' in Drata personnel."))
-        # Surface the actual field names returned by the API so it's easy to
-        # diagnose a field-name mismatch without digging into the code.
-        seen_keys = getattr(client, "_last_personnel_keys", [])
-        if seen_keys:
-            print(dim(f"  (Personnel records contain these fields: {', '.join(seen_keys)})"))
+        print(yellow(f"  '{owner_email}' was not found in Drata users."))
+        print(dim( "  Check that the address matches exactly what's in Drata → Settings → People."))
         skip = input(f"  {bold('Continue without assigning an owner?')} [y/N]: ").strip().lower()
         if skip != "y":
             print("Aborted.")
