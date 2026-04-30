@@ -434,9 +434,9 @@ def main() -> None:
     last_day     = calendar.monthrange(year, month)[1]  # [1] = number of days in month
     filed_at     = f"{year}-{month:02d}-{last_day}"
 
-    # Expiry = last day of the following month (e.g. March evidence expires April 30)
+    # Expiry = 1st of the following month (e.g. March evidence expires April 1)
     exp_year, exp_month = (year + 1, 1) if month == 12 else (year, month + 1)
-    renewal_date = f"{exp_year}-{exp_month:02d}-{calendar.monthrange(exp_year, exp_month)[1]}"
+    renewal_date = f"{exp_year}-{exp_month:02d}-01"
 
     print(f"\n  Period   : {bold(month_label)}")
     print(f"  Filed at : {dim(filed_at)}")
