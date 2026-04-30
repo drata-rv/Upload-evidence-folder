@@ -285,10 +285,12 @@ def scan_folder(root: Path, year: int, month: int) -> list[tuple[str, str, Path]
 
       AppName / SystemName / Year / Month / files
         → evidence_name = SystemName-filename  (e.g. 'Finance-report.csv')
-        → all files in the month dir are uploaded
 
     Month directories can be numeric ('03'), abbreviated ('Mar', 'Sept'),
     or full names ('March', 'September').
+
+    Prints a diagnostic line for every app so the caller can see exactly
+    what paths were evaluated and why documents were or weren't found.
     """
     if not root.is_dir():
         raise FileNotFoundError(f"Folder not found: {root}")
@@ -299,36 +301,63 @@ def scan_folder(root: Path, year: int, month: int) -> list[tuple[str, str, Path]
         if not app_dir.is_dir() or app_dir.name.startswith("."):
             continue
 
+        app_hits: list[tuple[str, str, Path]] = []
+
         for child in sorted(app_dir.iterdir()):
             if not child.is_dir() or child.name.startswith("."):
                 continue
 
             if _is_year(child.name):
-                # Layout: AppName/Year/Month — no system subfolder.
-                # Evidence name = the filename as-is.
+                # Layout: AppName / Year / Month / files
                 if int(child.name) != year:
                     continue
+
                 month_dir = _find_month_dir(child, month)
                 if not month_dir:
+                    print(dim(f"  {app_dir.name} / {child.name} / ??? "
+                              f"— no folder matching month {month}"))
                     continue
-                for doc in sorted(month_dir.iterdir()):
-                    if doc.is_file() and not doc.name.startswith("."):
-                        hits.append((app_dir.name, doc.name, doc))
+
+                docs = [d for d in sorted(month_dir.iterdir())
+                        if d.is_file() and not d.name.startswith(".")]
+                if not docs:
+                    print(dim(f"  {app_dir.name} / {child.name} / {month_dir.name} "
+                              f"— folder exists but contains no files"))
+                    continue
+
+                for doc in docs:
+                    app_hits.append((app_dir.name, doc.name, doc))
 
             else:
-                # Layout: AppName/SystemName/Year/Month — system subfolder present.
-                # Evidence name = SystemName-filename so every file is distinct
-                # and the system context is preserved in the evidence entry name.
+                # Layout: AppName / SystemName / Year / Month / files
                 sys_dir = child
                 year_dir = sys_dir / str(year)
+
                 if not year_dir.is_dir():
+                    print(dim(f"  {app_dir.name} / {sys_dir.name} / {year} "
+                              f"— year folder not found"))
                     continue
+
                 month_dir = _find_month_dir(year_dir, month)
                 if not month_dir:
+                    print(dim(f"  {app_dir.name} / {sys_dir.name} / {year} / ??? "
+                              f"— no folder matching month {month}"))
                     continue
-                for doc in sorted(month_dir.iterdir()):
-                    if doc.is_file() and not doc.name.startswith("."):
-                        hits.append((app_dir.name, f"{sys_dir.name}-{doc.name}", doc))
+
+                docs = [d for d in sorted(month_dir.iterdir())
+                        if d.is_file() and not d.name.startswith(".")]
+                if not docs:
+                    print(dim(f"  {app_dir.name} / {sys_dir.name} / {year} / {month_dir.name} "
+                              f"— folder exists but contains no files"))
+                    continue
+
+                for doc in docs:
+                    app_hits.append((app_dir.name, f"{sys_dir.name}-{doc.name}", doc))
+
+        if app_hits:
+            print(green(f"  {app_dir.name} → {len(app_hits)} file(s) queued"))
+
+        hits.extend(app_hits)
 
     return hits
 
