@@ -171,7 +171,7 @@ class DrataClient:
         filed_at: str,
         renewal_date: str,
         control_ids: list[int],
-        owner_id: int,
+        owner_id: Optional[int],
     ) -> dict:
         """Create a new Evidence Library entry and upload the file as its first version.
 
@@ -184,8 +184,9 @@ class DrataClient:
             ("filedAt",              filed_at),
             ("renewalScheduleType",  "CUSTOM"),  # expiry = last day of following month
             ("renewalDate",          renewal_date),
-            ("ownerId",              str(owner_id)),
         ]
+        if owner_id is not None:
+            fields.append(("ownerId", str(owner_id)))
         for cid in control_ids:
             fields.append(("controlIds", str(cid)))
 
@@ -205,7 +206,7 @@ class DrataClient:
         file_path: Path,
         filed_at: str,
         renewal_date: str,
-        owner_id: int,
+        owner_id: Optional[int],
     ) -> dict:
         """Upload a new file version to an existing Evidence Library entry.
 
@@ -213,16 +214,19 @@ class DrataClient:
         value (including an empty array) as a full replacement, so sending it
         would silently drop control mappings set elsewhere in Drata.
         """
+        data: dict = {
+            "filedAt":             filed_at,
+            "renewalScheduleType": "CUSTOM",
+            "renewalDate":         renewal_date,
+        }
+        if owner_id is not None:
+            data["ownerId"] = str(owner_id)
+
         with open(file_path, "rb") as fh:
             resp = self._s.put(
                 f"{self._base}/evidence-library/{evidence_id}",
                 files={"file": (file_path.name, fh)},
-                data={
-                    "filedAt":             filed_at,
-                    "renewalScheduleType": "CUSTOM",
-                    "renewalDate":         renewal_date,
-                    "ownerId":             str(owner_id),
-                },
+                data=data,
                 timeout=120,
             )
         self._check(resp)
@@ -470,13 +474,18 @@ def main() -> None:
     except DrataError as exc:
         print(red("FAILED"))
         print(red(f"  {exc}"))
-        sys.exit(1)
+        owner_id = None
 
     if not owner_id:
-        print(red("NOT FOUND"))
-        print(red(f"  No Drata personnel record found for '{owner_email}'."))
-        sys.exit(1)
-    print(green(f"ID = {owner_id}"))
+        print(yellow("NOT FOUND"))
+        print(yellow(f"  Could not resolve '{owner_email}' in Drata personnel."))
+        skip = input(f"  {bold('Continue without assigning an owner?')} [y/N]: ").strip().lower()
+        if skip != "y":
+            print("Aborted.")
+            sys.exit(1)
+        print(yellow("  Proceeding without owner — you can assign one manually in Drata."))
+    else:
+        print(green(f"ID = {owner_id}"))
 
     # ── Upload loop ───────────────────────────────────────────────────────────
     print(f"\n{bold('─── Uploading ───────────────────────────────────')}\n")
