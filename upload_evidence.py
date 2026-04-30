@@ -2,17 +2,23 @@
 """
 Drata Evidence Uploader
 -----------------------
-Every month a new document lands in a folder tree maintained by the compliance
+Every month new documents land in a folder tree maintained by the compliance
 team.  This script walks that tree, finds the documents for the target month,
 and syncs them into Drata's Evidence Library — creating a new entry if one
-doesn't exist yet, or uploading a new version if it does.  Every entry is
-mapped to control MICS-35 (Monitoring & Incident Controls Standard, item 35),
-which Drata uses to track this class of recurring operational evidence.
+doesn't exist yet, or uploading a new version if it does.
 
-Folder layout expected (script must be run from the root):
-  <root>/<AppName>/<SystemName>/<YYYY>/<MM>/<document>
+Two folder layouts are supported (auto-detected):
 
-Evidence entries are named:  "<AppName> - <SystemName> - YYYY-MM"
+  AppName / YYYY / Month / files
+    Evidence name  →  filename
+    Control        →  UAR-<AppName>
+
+  AppName / SystemName / YYYY / Month / files
+    Evidence name  →  SystemName-filename
+    Control        →  UAR-<AppName>
+
+Evidence expires at the end of the month following the one being filed
+(e.g. March evidence expires April 30).
 
 Usage:
     cd /path/to/evidence/root
@@ -87,7 +93,6 @@ dim    = lambda t: _c("2",  t)
 # ── Drata API client ──────────────────────────────────────────────────────────
 
 DRATA_BASE = "https://public-api.drata.com/public/v2"
-TARGET_CONTROL = "MICS-35"
 
 
 class DrataError(Exception):
@@ -159,6 +164,7 @@ class DrataClient:
         name: str,
         file_path: Path,
         filed_at: str,
+        renewal_date: str,
         control_ids: list[int],
         owner_id: int,
     ) -> dict:
@@ -171,7 +177,8 @@ class DrataClient:
         fields = [
             ("name",                 name),
             ("filedAt",              filed_at),
-            ("renewalScheduleType",  "ONE_MONTH"),  # evidence renews every month
+            ("renewalScheduleType",  "CUSTOM"),  # expiry = last day of following month
+            ("renewalDate",          renewal_date),
             ("ownerId",              str(owner_id)),
         ]
         for cid in control_ids:
@@ -192,6 +199,7 @@ class DrataClient:
         evidence_id: int,
         file_path: Path,
         filed_at: str,
+        renewal_date: str,
         owner_id: int,
     ) -> dict:
         """Upload a new file version to an existing Evidence Library entry.
@@ -206,7 +214,8 @@ class DrataClient:
                 files={"file": (file_path.name, fh)},
                 data={
                     "filedAt":             filed_at,
-                    "renewalScheduleType": "ONE_MONTH",
+                    "renewalScheduleType": "CUSTOM",
+                    "renewalDate":         renewal_date,
                     "ownerId":             str(owner_id),
                 },
                 timeout=120,
@@ -249,41 +258,30 @@ def _find_month_dir(year_dir: Path, month: int) -> Optional[Path]:
             return d
     return None
 
-# Matches a leading date stamp like '2026.3 - ' or '2025.11 – '
-_DATE_PREFIX = re.compile(r'^\d{4}\.\d{1,2}\s*[-–]\s*')
+def _control_code(app_name: str) -> str:
+    """Derive the UAR control code from an app folder name.
 
-def _report_type(stem: str, app_name: str) -> str:
+    'Active Directory' → 'UAR-ActiveDirectory'
+    'Synkros'          → 'UAR-Synkros'
     """
-    Derive a stable, human-readable report type from a file stem.
-
-    '2026.3 - Synkros - Employee Roles Listing Report' → 'Employee Roles Listing Report'
-    'Access Matrix – Synkros – DRAFT'                  → 'Access Matrix – Synkros – DRAFT'
-
-    The result is used as the middle segment of the Drata evidence label so that
-    the same report type maps to the same evidence entry every month.
-    """
-    cleaned = _DATE_PREFIX.sub("", stem).strip()
-    # Strip the app name from the front if the filename leads with it
-    cleaned = re.sub(
-        rf'^{re.escape(app_name)}\s*[-–]\s*', "", cleaned, flags=re.IGNORECASE
-    ).strip()
-    return cleaned or stem
+    return "UAR-" + app_name.replace(" ", "")
 
 
 # ── Folder scanner ────────────────────────────────────────────────────────────
 
 def scan_folder(root: Path, year: int, month: int) -> list[tuple[str, str, Path]]:
     """
-    Return (app_name, label_middle, file_path) for every document that belongs
+    Return (app_name, evidence_name, file_path) for every document that belongs
     to the requested month.
 
     Handles two layouts automatically:
 
-      AppName / Year / Month / files          (no system level)
-        → one entry per file, label_middle derived from the filename
+      AppName / Year / Month / files
+        → evidence_name = filename  (e.g. 'report.csv')
 
-      AppName / SystemName / Year / Month / file   (system level present)
-        → one entry per system, label_middle = SystemName
+      AppName / SystemName / Year / Month / files
+        → evidence_name = SystemName-filename  (e.g. 'Finance-report.csv')
+        → all files in the month dir are uploaded
 
     Month directories can be numeric ('03'), abbreviated ('Mar', 'Sept'),
     or full names ('March', 'September').
@@ -303,8 +301,7 @@ def scan_folder(root: Path, year: int, month: int) -> list[tuple[str, str, Path]
 
             if _is_year(child.name):
                 # Layout: AppName/Year/Month — no system subfolder.
-                # Upload every file in the month dir as its own evidence entry,
-                # using the cleaned filename as the differentiating label segment.
+                # Evidence name = the filename as-is.
                 if int(child.name) != year:
                     continue
                 month_dir = _find_month_dir(child, month)
@@ -312,11 +309,12 @@ def scan_folder(root: Path, year: int, month: int) -> list[tuple[str, str, Path]
                     continue
                 for doc in sorted(month_dir.iterdir()):
                     if doc.is_file() and not doc.name.startswith("."):
-                        hits.append((app_dir.name, _report_type(doc.stem, app_dir.name), doc))
+                        hits.append((app_dir.name, doc.name, doc))
 
             else:
                 # Layout: AppName/SystemName/Year/Month — system subfolder present.
-                # The system name becomes the label middle; take the first file.
+                # Evidence name = SystemName-filename so every file is distinct
+                # and the system context is preserved in the evidence entry name.
                 sys_dir = child
                 year_dir = sys_dir / str(year)
                 if not year_dir.is_dir():
@@ -324,18 +322,9 @@ def scan_folder(root: Path, year: int, month: int) -> list[tuple[str, str, Path]
                 month_dir = _find_month_dir(year_dir, month)
                 if not month_dir:
                     continue
-                docs = [
-                    f for f in sorted(month_dir.iterdir())
-                    if f.is_file() and not f.name.startswith(".")
-                ]
-                if not docs:
-                    continue
-                if len(docs) > 1:
-                    print(yellow(
-                        f"  Warning: multiple files under {month_dir}; "
-                        f"using first: {docs[0].name}"
-                    ))
-                hits.append((app_dir.name, sys_dir.name, docs[0]))
+                for doc in sorted(month_dir.iterdir()):
+                    if doc.is_file() and not doc.name.startswith("."):
+                        hits.append((app_dir.name, f"{sys_dir.name}-{doc.name}", doc))
 
     return hits
 
@@ -367,7 +356,7 @@ def ask_month() -> tuple[int, int]:
 BANNER = f"""
 {cyan('╔══════════════════════════════════════════════╗')}
 {cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v1.0')}              {cyan('║')}
-{cyan('║')}   Automates monthly evidence → {bold('MICS-35')}       {cyan('║')}
+{cyan('║')}   Automates monthly evidence → {bold('UAR controls')}  {cyan('║')}
 {cyan('╚══════════════════════════════════════════════╝')}
 """
 
@@ -386,8 +375,13 @@ def main() -> None:
     last_day     = calendar.monthrange(year, month)[1]  # [1] = number of days in month
     filed_at     = f"{year}-{month:02d}-{last_day}"
 
+    # Expiry = last day of the following month (e.g. March evidence expires April 30)
+    exp_year, exp_month = (year + 1, 1) if month == 12 else (year, month + 1)
+    renewal_date = f"{exp_year}-{exp_month:02d}-{calendar.monthrange(exp_year, exp_month)[1]}"
+
     print(f"\n  Period   : {bold(month_label)}")
     print(f"  Filed at : {dim(filed_at)}")
+    print(f"  Expires  : {dim(renewal_date)}")
     print(f"  Root     : {dim(str(root_path))}")
 
     # ── Scan ──────────────────────────────────────────────────────────────────
@@ -402,9 +396,9 @@ def main() -> None:
         print(yellow(f"No documents found for {month_label}.  Nothing to upload."))
         sys.exit(0)
 
-    for app, system, doc in documents:
-        label = f"{app} - {system} - {month_label}"
-        print(f"  {green('●')} {bold(label)}")
+    for app, evidence_name, doc in documents:
+        code = _control_code(app)
+        print(f"  {green('●')} {bold(evidence_name)}  {dim(f'→ {code}')}")
         print(f"      {dim(doc.name)}")
 
     confirm = input(f"\n{bold('Upload these')} {len(documents)} document(s)? [Y/n]: ").strip().lower()
@@ -416,21 +410,6 @@ def main() -> None:
     client = DrataClient(api_token, workspace_id)
 
     print(f"\n{bold('─── Resolving IDs ───────────────────────────────')}\n")
-
-    # Control
-    print(f"  Looking up {bold(TARGET_CONTROL)}... ", end="", flush=True)
-    try:
-        control_id = client.find_control_id(TARGET_CONTROL)
-    except DrataError as exc:
-        print(red("FAILED"))
-        print(red(f"  {exc}"))
-        sys.exit(1)
-
-    if not control_id:
-        print(red("NOT FOUND"))
-        print(red(f"  No control with code '{TARGET_CONTROL}' in workspace {workspace_id}."))
-        sys.exit(1)
-    print(green(f"ID = {control_id}"))
 
     # Owner
     owner_email = ask("Owner email (evidence will be assigned to this person)")
@@ -452,23 +431,50 @@ def main() -> None:
     print(f"\n{bold('─── Uploading ───────────────────────────────────')}\n")
     created = updated = failed = 0
 
-    for app, system, doc_path in documents:
-        label = f"{app} - {system} - {month_label}"
-        print(f"  {bold(label)}")
+    # Cache control IDs so we only hit the API once per unique app name
+    control_cache: dict[str, Optional[int]] = {}
+
+    for app, evidence_name, doc_path in documents:
+        code = _control_code(app)
+        print(f"  {bold(evidence_name)}  {dim(f'[{code}]')}")
         print(f"  {dim('file:')} {doc_path.name}")
 
+        # Resolve this app's control (cached after first lookup)
+        if code not in control_cache:
+            print(f"  {dim('→')} Looking up control {code}... ", end="", flush=True)
+            try:
+                control_cache[code] = client.find_control_id(code)
+            except DrataError as exc:
+                print(red("FAILED"))
+                print(red(f"  API error: {exc}"))
+                control_cache[code] = None
+
+            if control_cache[code]:
+                print(green(f"ID = {control_cache[code]}"))
+            else:
+                print(red("NOT FOUND"))
+                print(red(f"  No control '{code}' in workspace — skipping this app's files."))
+
+        control_id = control_cache[code]
+        if not control_id:
+            failed += 1
+            print()
+            continue
+
         try:
-            existing = client.find_evidence(label)
+            existing = client.find_evidence(evidence_name)
 
             if existing:
                 ev_id = existing["id"]
                 print(f"  {dim('→')} Found entry (ID {ev_id}) — uploading new version... ", end="", flush=True)
-                client.update_evidence(ev_id, doc_path, filed_at, owner_id)
+                client.update_evidence(ev_id, doc_path, filed_at, renewal_date, owner_id)
                 print(green("UPDATED"))
                 updated += 1
             else:
                 print(f"  {dim('→')} No existing entry — creating... ", end="", flush=True)
-                result = client.create_evidence(label, doc_path, filed_at, [control_id], owner_id)
+                result = client.create_evidence(
+                    evidence_name, doc_path, filed_at, renewal_date, [control_id], owner_id
+                )
                 print(green(f"CREATED (ID {result['id']})"))
                 created += 1
 
