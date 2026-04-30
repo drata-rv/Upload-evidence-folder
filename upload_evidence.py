@@ -135,12 +135,17 @@ class DrataClient:
     # ── public methods ────────────────────────────────────────────────────────
 
     def find_user_by_email(self, email: str) -> Optional[int]:
-        """Return the personnelId for a Drata user by their email address."""
-        resp = self._s.get(f"{self._base}/personnel/email:{email}", timeout=30)
-        self._check(resp)
-        body = resp.json()
-        # Drata v2 uses "personnelId"; guard against "id" in case the schema shifts
-        return body.get("personnelId") or body.get("id")
+        """Return the personnelId for a Drata user by searching personnel by email.
+
+        The /personnel/email:{email} path format returns 404 in practice, so we
+        paginate the full personnel list and match by email instead.
+        """
+        needle = email.lower()
+        for person in self._paginate(f"{self._base}/personnel", {"size": 500}):
+            candidate = (person.get("email") or person.get("emailAddress") or "").lower()
+            if candidate == needle:
+                return person.get("personnelId") or person.get("id")
+        return None
 
     def find_control_id(self, code: str) -> Optional[int]:
         """Return the numeric ID of a control by its code (e.g. 'MICS-35')."""
@@ -319,7 +324,7 @@ def scan_folder(root: Path, year: int, month: int) -> list[tuple[str, str, Path]
                     continue
 
                 docs = [d for d in sorted(month_dir.iterdir())
-                        if d.is_file() and not d.name.startswith(".")]
+                        if not d.is_dir() and not d.name.startswith(".")]
                 if not docs:
                     print(dim(f"  {app_dir.name} / {child.name} / {month_dir.name} "
                               f"— folder exists but contains no files"))
@@ -345,7 +350,7 @@ def scan_folder(root: Path, year: int, month: int) -> list[tuple[str, str, Path]
                     continue
 
                 docs = [d for d in sorted(month_dir.iterdir())
-                        if d.is_file() and not d.name.startswith(".")]
+                        if not d.is_dir() and not d.name.startswith(".")]
                 if not docs:
                     print(dim(f"  {app_dir.name} / {sys_dir.name} / {year} / {month_dir.name} "
                               f"— folder exists but contains no files"))
