@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Drata Evidence Uploader  v2.0
+Drata Evidence Uploader  v2.1
 ------------------------------
 Every month new documents land in a folder tree maintained by the compliance
 team.  This script walks that tree, finds the documents for the target month,
@@ -329,40 +329,57 @@ _DASH = r"[–\-]"
 
 
 def _clean_stem(stem: str, app_name: str) -> tuple[str, bool]:
-    """Strip known date tokens from a filename stem.
+    """Strip known date and noise tokens from a filename stem.
 
-    Returns (cleaned_stem, was_stripped).  was_stripped=True means at least
-    one of the three known date patterns was found and removed.
+    Returns (cleaned_stem, was_stripped).
 
-    Pattern 1 — leading YYYY.M – [AppName –]:
-        '2026.4 – Synkros – Employee Roles Listing Report'
-        → 'Employee Roles Listing Report'
+    Pattern 0 — trailing copy numbers  (1), (3):
+        'LVPWAPBPIT1 - Administrators - 08022024 (3)'  →  copy number gone first
 
-    Pattern 2 — trailing – MMDDYYYY (separator + exactly 8 digits):
-        'LVPDBEMARK1 – Remote Desktop Users – 04142026'
-        → 'LVPDBEMARK1 – Remote Desktop Users'
+    Pattern 1 — leading YY.M or YYYY.M – [AppName –]:
+        '24.04-Bravo-Employee Security Level Report'  →  'Employee Security Level Report'
+        '2026.4 – Synkros – Employee Roles Listing Report'  →  'Employee Roles Listing Report'
 
-    Pattern 3 — trailing -MM.DD.YY(YY):
-        'Stadium-04.21.26'
-        → 'Stadium'
+    Pattern 2 — trailing – MMDDYYYY or _MMDDYYYY (8-digit date block):
+        'LVPDBEMARK1 – Remote Desktop Users – 04142026'  →  'LVPDBEMARK1 – Remote Desktop Users'
+        'LVPWDBBPIT1_DBO_10012024'  →  'LVPWDBBPIT1_DBO'
+
+    Pattern 3 — trailing date with dash, en-dash, OR space: [–\s]M.DD.YY(YY):
+        'Stadium-04.21.26'     →  'Stadium'
+        'SystemUsers 08.15.24' →  'SystemUsers'
+        'Stadium FB SystemUsers 3.4.25' →  'Stadium FB SystemUsers'
+
+    Pattern 4 — leading server/host code (ALL-CAPS + digits):
+        'LVPWAPBPIT1 - Remote Desktop Users'  →  'Remote Desktop Users'
+        'LVPDBEMARK1_DBO'                     →  'DBO'
     """
     s = stem
     n = 0
 
-    # Pattern 1: leading YYYY.M – [AppName –]
+    # Pattern 0: trailing copy numbers like (1), (3), (4)
+    s, k = re.subn(r"\s*\(\d+\)$", "", s)
+    n += k
+
+    # Pattern 1: leading YY.M or YYYY.M – [AppName –]  (space around separator OK)
     s, k = re.subn(
-        r"^\d{4}[.\-]\d{1,2}\s*" + _DASH + r"\s*(?:"
+        r"^\d{2,4}\s*[.\-]\s*\d{1,2}\s*" + _DASH + r"\s*(?:"
         + re.escape(app_name) + r"\s*" + _DASH + r"\s*)?",
         "", s, flags=re.IGNORECASE,
     )
     n += k
 
-    # Pattern 2: trailing – MMDDYYYY
-    s, k = re.subn(r"\s*" + _DASH + r"\s*\d{8}$", "", s)
+    # Pattern 2: trailing 6-8 digit date block with dash, underscore, or space separator
+    # Covers MMDDYYYY (8-digit), MMDDYY (6-digit), and MMDDYYY edge cases.
+    s, k = re.subn(r"(?:\s*[-–_]\s*|\s+)\d{6,8}$", "", s)
     n += k
 
-    # Pattern 3: trailing -MM.DD.YY or -MM.DD.YYYY
-    s, k = re.subn(_DASH + r"\d{2}\.\d{2}\.\d{2,4}$", "", s)
+    # Pattern 3: trailing date with dash, en-dash, or space separator
+    # Allows single-digit month OR day (e.g. 3.4.25 = March 4, 2025).
+    s, k = re.subn(r"[-–\s]\d{1,2}\.\d{1,2}\.\d{2,4}$", "", s)
+    n += k
+
+    # Pattern 4: leading server/host code (all-uppercase + digits, e.g. LVPWAPBPIT1)
+    s, k = re.subn(r"^[A-Z]{2}[A-Z0-9]+(?:\s*[-–_]\s*|\s+)", "", s)
     n += k
 
     return s.strip(" –-"), n > 0
@@ -376,7 +393,7 @@ def _is_date_contaminated(stem: str) -> bool:
     return bool(
         re.search(r"\b\d{6,8}\b", stem)                         # standalone 6–8 digit number
         or re.search(r"\b\d{2}[./]\d{2}[./]\d{2,4}\b", stem)   # MM.DD.YY(YY) embedded
-        or re.match(r"^\d{4}[.]\d{1,2}", stem)                  # leading YYYY.M
+        or re.match(r"^\d{2,4}[.\-]\d{1,2}", stem)               # leading YY.M or YYYY.M
     )
 
 
@@ -385,34 +402,52 @@ def _build_evidence_name(
     sys_name: Optional[str],
     cleaned_stem: str,
 ) -> str:
-    """Assemble the stable evidence name from path components.
+    """Assemble the stable evidence name from path components + cleaned stem.
 
-    Strips redundant app/system name repetition from the cleaned stem so
-    'Stadium' doesn't become 'Stadium - Stadium'.
+    Strips redundant app/system name repetition so 'Stadium SystemUsers'
+    becomes 'Stadium - SystemUsers', not 'Stadium - Stadium SystemUsers'.
 
-    Examples:
-        ('Stadium',  None,       'Stadium')                    → 'Stadium'
-        ('Synkros',  None,       'Employee Roles Listing Report') → 'Synkros - Employee Roles Listing Report'
-        ('Synkros',  'Database', 'Employee Roles Listing Report') → 'Synkros - Database - Employee Roles Listing Report'
+    Also handles noise prefixes like 'BravoPit-' (app variant) and
+    'Pit - Application Server - ' (venue + sys name after app strip).
     """
     s = cleaned_stem
-    # Remove leading app name if the stem repeats it.
+
+    # Strip leading app-name variants: "Bravo -", "BravoPit-", "Stadium " (space only).
     s = re.sub(
-        r"^" + re.escape(app_name) + r"\s*" + _DASH + r"\s*",
+        r"^" + re.escape(app_name) + r"\w*\s*(?:" + _DASH + r"\s*|\s+)",
         "", s, flags=re.IGNORECASE,
     ).strip()
-    # Remove leading system name if the stem repeats it.
+
     if sys_name:
-        s = re.sub(
+        # Try normal leading prefix first.
+        s2 = re.sub(
             r"^" + re.escape(sys_name) + r"\s*" + _DASH + r"\s*",
             "", s, flags=re.IGNORECASE,
         ).strip()
+        if s2 != s:
+            s = s2
+        else:
+            # sys_name may follow a noise token like "Pit – ".
+            # Only search within the first 40 characters to avoid false positives.
+            m = re.search(
+                re.escape(sys_name) + r"\s*" + _DASH + r"\s*",
+                s[:40], flags=re.IGNORECASE,
+            )
+            if m:
+                s = s[m.end():].strip()
+
+    # Normalise underscores to spaces.
+    s = s.replace("_", " ").strip()
+
+    # Final pass: strip any leading server/host code still present.
+    # e.g. "LVPWAPBPIT1 Administrators" → "Administrators"
+    s = re.sub(r"^[A-Z]{2}[A-Z0-9]+ ", "", s).strip()
+
     s = s.strip(" –-")
 
     parts = [app_name]
     if sys_name:
         parts.append(sys_name)
-    # Append the stem only when it adds meaningful info beyond app/system name.
     if s and s.lower() not in {app_name.lower(), (sys_name or "").lower()}:
         parts.append(s)
 
@@ -471,6 +506,20 @@ def _resolve_names(
 
 
 # ── Folder scanner ────────────────────────────────────────────────────────────
+
+def _stem_month(raw_stem: str) -> Optional[int]:
+    """Extract the month number from a trailing MM.DD.YY pattern in a stem.
+
+    Only inspects the trailing date format because it is unambiguous about
+    which part is the month.  Returns None if no such pattern is present.
+    Used to detect files whose embedded date does not match their folder month.
+    """
+    m = re.search(r"[-–\s](\d{1,2})\.\d{1,2}\.\d{2,4}$", raw_stem)
+    if m:
+        mon = int(m.group(1))
+        return mon if 1 <= mon <= 12 else None
+    return None
+
 
 def scan_folder(
     root: Path,
@@ -537,6 +586,14 @@ def scan_folder(
                     continue
 
                 for doc in docs:
+                    # Skip files whose embedded date month ≠ folder month.
+                    doc_mon = _stem_month(doc.stem)
+                    if doc_mon is not None and doc_mon != month:
+                        print(yellow(
+                            f"  SKIP  {app_dir.name}/{child.name}/{month_dir.name}/{doc.name}"
+                            f"  (filename month {doc_mon:02d} ≠ folder month {month:02d})"
+                        ))
+                        continue
                     cleaned, stripped = _clean_stem(doc.stem, app_dir.name)
                     app_hits.append(ScanRaw(
                         app_name=app_dir.name,
@@ -584,6 +641,14 @@ def scan_folder(
                     continue
 
                 for doc in docs:
+                    # Skip files whose embedded date month ≠ folder month.
+                    doc_mon = _stem_month(doc.stem)
+                    if doc_mon is not None and doc_mon != month:
+                        print(yellow(
+                            f"  SKIP  {app_dir.name}/{sys_dir.name}/{year}/{month_dir.name}/{doc.name}"
+                            f"  (filename month {doc_mon:02d} ≠ folder month {month:02d})"
+                        ))
+                        continue
                     cleaned, stripped = _clean_stem(doc.stem, app_dir.name)
                     app_hits.append(ScanRaw(
                         app_name=app_dir.name,
@@ -615,6 +680,66 @@ def iter_months(sy: int, sm: int, ey: int, em: int):
         if month > 12:
             month = 1
             year += 1
+
+
+# ── Deduplication ─────────────────────────────────────────────────────────────
+
+def _dedup_items(
+    items: list[UploadItem],
+) -> tuple[list[UploadItem], int]:
+    """Keep only the first item per (evidence_name, year, month) group.
+
+    Files within a month folder are already sorted alphabetically by scan_folder,
+    so the first occurrence is the earliest-dated file — which is what we want
+    for months that contain multiple snapshots of the same report (e.g. Stadium
+    weekly SystemUsers exports).
+
+    Returns (deduped_list, n_skipped).
+    """
+    seen: set[tuple] = set()
+    result: list[UploadItem] = []
+    skipped = 0
+    for item in items:
+        key = (item.evidence_name, item.year, item.month)
+        if key in seen:
+            skipped += 1
+        else:
+            seen.add(key)
+            result.append(item)
+    return result, skipped
+
+
+# ── Dry-run output ─────────────────────────────────────────────────────────────
+
+def _print_dry_run(items: list[UploadItem], n_skipped: int) -> None:
+    """Print the full proposed evidence mapping; no API calls are made."""
+    print(f"\n{bold('─── Dry-run: proposed mapping ───────────────────')}\n")
+    current_month: Optional[str] = None
+    for item in items:
+        label = f"{item.year}-{item.month:02d}"
+        if label != current_month:
+            current_month = label
+            print(f"  {cyan(f'[ {label} ]')}")
+        try:
+            rel: Path = item.file_path.relative_to(Path.cwd())
+        except ValueError:
+            rel = item.file_path
+        print(f"    {green('→')} {bold(item.evidence_name)}")
+        print(f"       {dim(str(rel))}")
+
+    print(f"\n{bold('─── Evidence holders per app ────────────────────')}\n")
+    by_app: dict[str, set[str]] = {}
+    for item in items:
+        by_app.setdefault(item.app_name, set()).add(item.evidence_name)
+    for app in sorted(by_app):
+        print(f"  {bold(app)}")
+        for name in sorted(by_app[app]):
+            print(f"    {green('●')} {name}")
+        print()
+
+    print(dim(f"  {len(items)} file(s) would be uploaded  |  {n_skipped} duplicate(s) skipped"))
+    print(f"\n{yellow('Dry run complete — no data was uploaded.')}")
+    print(f"  Re-run without {bold('--dry-run')} to upload.\n")
 
 
 # ── Interactive helpers ───────────────────────────────────────────────────────
@@ -657,7 +782,7 @@ def ask_month(label: str = "Month to process") -> tuple[int, int]:
 
 BANNER = f"""
 {cyan('╔══════════════════════════════════════════════╗')}
-{cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v2.0')}              {cyan('║')}
+{cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v2.1')}              {cyan('║')}
 {cyan('║')}   Automates monthly evidence → {bold('UAR controls')}  {cyan('║')}
 {cyan('╚══════════════════════════════════════════════╝')}
 """
@@ -669,7 +794,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Single month:  python upload_evidence.py\n"
-            "Backfill:      python upload_evidence.py --backfill"
+            "Backfill:      python upload_evidence.py --backfill\n"
+            "Dry run:       python upload_evidence.py --backfill --dry-run"
         ),
     )
     parser.add_argument(
@@ -677,15 +803,25 @@ def main() -> None:
         action="store_true",
         help="Upload evidence for a configurable date range (one-time historical backfill)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Scan and show the proposed evidence mapping without uploading anything",
+    )
     args = parser.parse_args()
 
     print(BANNER)
 
     # ── Config ────────────────────────────────────────────────────────────────
     print(bold("─── Configuration ───────────────────────────────\n"))
-    api_token    = ask("Drata API token", secret=True)
-    workspace_id = ask("Workspace ID")
-    root_path    = Path.cwd()
+    root_path = Path.cwd()
+    if args.dry_run:
+        api_token = workspace_id = ""
+        print(dim("  Dry-run mode — no credentials required, nothing will be uploaded.\n"))
+    else:
+        api_token    = ask("Drata API token", secret=True)
+        workspace_id = ask("Workspace ID")
 
     # ── Date range ────────────────────────────────────────────────────────────
     if args.backfill:
@@ -735,7 +871,16 @@ def main() -> None:
     if args.backfill:
         print(f"\n{bold('─── Resolving evidence names ────────────────────')}\n")
     name_cache: dict[tuple, str] = {}
-    documents = _resolve_names(all_raw, name_cache)
+    documents_raw = _resolve_names(all_raw, name_cache)
+
+    # Deduplicate: for each (evidence_name, year, month) keep the first file
+    # alphabetically (= oldest date when filenames are date-suffixed).
+    documents, n_skipped = _dedup_items(documents_raw)
+
+    # ── Dry-run exit ──────────────────────────────────────────────────────────
+    if args.dry_run:
+        _print_dry_run(documents, n_skipped)
+        sys.exit(0)
 
     # ── Upload plan ───────────────────────────────────────────────────────────
     print(f"\n{bold('─── Upload plan ─────────────────────────────────')}\n")
@@ -758,6 +903,8 @@ def main() -> None:
             print(f"      {dim(item.file_path.name)}")
 
     total = len(documents)
+    if n_skipped:
+        print(dim(f"  ({n_skipped} duplicate(s) skipped — same holder, same month, kept oldest)"))
     if args.backfill:
         months_with_files = len(set((d.year, d.month) for d in documents))
         prompt_label = f"Upload {total} document(s) across {months_with_files} month(s)?"
