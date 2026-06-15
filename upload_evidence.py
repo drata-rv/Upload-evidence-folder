@@ -1,47 +1,61 @@
 #!/usr/bin/env python3
 """
-Drata Evidence Uploader
------------------------
+Drata Evidence Uploader  v2.0
+------------------------------
 Every month new documents land in a folder tree maintained by the compliance
 team.  This script walks that tree, finds the documents for the target month,
 and syncs them into Drata's Evidence Library — creating a new entry if one
 doesn't exist yet, or uploading a new version if it does.
 
-Two folder layouts are supported (auto-detected):
+Evidence names are STABLE across months: date tokens are stripped from
+filenames so the same Evidence Library entry is updated every month rather
+than a new entry being created each time.
+
+Two folder layouts are supported (auto-detected per app, mixed layouts within
+the same app folder are handled):
 
   AppName / YYYY / Month / files
-    Evidence name  →  filename
+    Evidence name  →  AppName  (or  AppName - ReportName  for multi-file apps)
     Control        →  UAR-<AppName>
 
   AppName / SystemName / YYYY / Month / files
-    Evidence name  →  SystemName-filename
+    Evidence name  →  AppName - SystemName  (or  AppName - SystemName - ReportName)
     Control        →  UAR-<AppName>
 
-Evidence expires at the end of the month following the one being filed
-(e.g. March evidence expires April 30).
+Evidence expires on the 1st of the month following the one being filed
+(e.g. April evidence expires May 1).
 
-Usage:
+Usage — single month (interactive):
     cd /path/to/evidence/root
     python upload_evidence.py
+
+Usage — historical backfill (one-time, configurable date range):
+    cd /path/to/evidence/root
+    python upload_evidence.py --backfill
 
 Requirements:
     pip install requests
 """
 
+from __future__ import annotations
+
 import os
 import re
 import sys
+import argparse
 import getpass
 import calendar
 import datetime
+from itertools import groupby
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 try:
     import requests
 except ImportError:
     print("ERROR: 'requests' package is required.  Run:  pip install requests")
     sys.exit(1)
+
 
 # ── Console setup (Windows-safe ANSI + UTF-8) ─────────────────────────────────
 
@@ -55,14 +69,14 @@ def _setup_console() -> bool:
         return False
 
     if os.name == "nt":
-        # Reconfigure stdout/stderr so Unicode box-drawing chars don't blow up
+        # Reconfigure stdout/stderr so Unicode box-drawing chars don't blow up.
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
         except AttributeError:
             pass
 
-        # Ask Windows to honour ANSI escape sequences in the console
+        # Ask Windows to honour ANSI escape sequences in the console.
         try:
             import ctypes
             kernel32 = ctypes.windll.kernel32
@@ -70,12 +84,12 @@ def _setup_console() -> bool:
             kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 0x0007)
             return True
         except Exception:
-            return False  # Older Windows without VT support — colours off, no crash
+            return False  # Older Windows without VT support — colours off, no crash.
 
     return True
 
 
-# Resolved once at import so stdout is reconfigured before the first print()
+# Resolved once at import so stdout is reconfigured before the first print().
 _ANSI_OK = _setup_console()
 
 
@@ -137,10 +151,9 @@ class DrataClient:
     def find_user_by_email(self, email: str) -> Optional[int]:
         """Return the Drata user ID for the given email address.
 
-        Uses GET /users/email:{email} — a direct lookup endpoint that requires
-        no pagination and is not workspace-scoped.  Drata's Evidence Library
-        API accepts ownerId as a numeric integer only, so this lookup is the
-        only way to convert an email address to a usable ID.
+        Uses GET /users/email:{email} — a direct lookup that is not workspace-
+        scoped.  Drata's Evidence Library API accepts ownerId as a numeric
+        integer only, so this lookup is the only path from email to ID.
 
         Returns None (without raising) on 404 so the caller can offer the
         "continue without owner" fallback.
@@ -148,11 +161,11 @@ class DrataClient:
         resp = self._s.get(f"{DRATA_BASE}/users/email:{email}", timeout=30)
         if resp.status_code == 404:
             return None
-        self._check(resp)  # raises DrataError on any other non-2xx
+        self._check(resp)
         return resp.json().get("id")
 
     def find_control_id(self, code: str) -> Optional[int]:
-        """Return the numeric ID of a control by its code (e.g. 'MICS-35')."""
+        """Return the numeric ID of a control by its code (e.g. 'UAR-Synkros')."""
         for ctrl in self._paginate(f"{self._base}/controls", {"size": 500}):
             if ctrl.get("code") == code:
                 return ctrl["id"]
@@ -160,7 +173,7 @@ class DrataClient:
 
     def find_evidence(self, name: str) -> Optional[dict]:
         """Return the first evidence entry whose name matches exactly, or None."""
-        # The API supports name filtering — use it to narrow the scan
+        # The API supports name filtering — use it to narrow the scan.
         for item in self._paginate(
             f"{self._base}/evidence-library", {"size": 50, "name": name}
         ):
@@ -179,15 +192,15 @@ class DrataClient:
     ) -> dict:
         """Create a new Evidence Library entry and upload the file as its first version.
 
-        fields is a list of tuples (not a dict) because multipart/form-data allows
-        repeated keys — the only way to send an array like controlIds over this
-        content type without serialising to JSON.
+        fields is a list of tuples (not a dict) because multipart/form-data
+        allows repeated keys — the only way to send an array like controlIds
+        over this content type without serialising to JSON.
         """
         fields = [
-            ("name",                 name),
-            ("filedAt",              filed_at),
-            ("renewalScheduleType",  "CUSTOM"),  # expiry = last day of following month
-            ("renewalDate",          renewal_date),
+            ("name",                name),
+            ("filedAt",             filed_at),
+            ("renewalScheduleType", "CUSTOM"),
+            ("renewalDate",         renewal_date),
         ]
         if owner_id is not None:
             fields.append(("ownerId", str(owner_id)))
@@ -214,8 +227,8 @@ class DrataClient:
     ) -> dict:
         """Upload a new file version to an existing Evidence Library entry.
 
-        controlIds is intentionally omitted: the PUT endpoint treats any supplied
-        value (including an empty array) as a full replacement, so sending it
+        controlIds is intentionally omitted: the PUT endpoint treats any
+        supplied value (including an empty array) as a full replacement, which
         would silently drop control mappings set elsewhere in Drata.
         """
         data: dict = {
@@ -240,7 +253,7 @@ class DrataClient:
 # ── Month name resolution ─────────────────────────────────────────────────────
 
 # Covers numeric, abbreviated, and full month names including non-standard
-# abbreviations actually seen in the wild (Sept, July, June, April).
+# abbreviations seen in real folder trees (Sept, July, June, April).
 MONTH_MAP: dict[str, int] = {
     "1": 1,  "01": 1,  "jan": 1,  "january": 1,
     "2": 2,  "02": 2,  "feb": 2,  "february": 2,
@@ -256,25 +269,29 @@ MONTH_MAP: dict[str, int] = {
     "12": 12, "dec": 12, "december": 12,
 }
 
+
 def _parse_month(name: str) -> Optional[int]:
     """Return the month number for a folder name, or None if unrecognisable."""
     return MONTH_MAP.get(name.lower())
 
+
 def _is_year(name: str) -> bool:
     """True if the folder name is a 4-digit year."""
-    return bool(re.fullmatch(r'\d{4}', name))
+    return bool(re.fullmatch(r"\d{4}", name))
+
 
 def _find_month_dir(year_dir: Path, month: int) -> Optional[Path]:
-    """Return the child directory of year_dir whose name resolves to month."""
+    """Return the child of year_dir whose name resolves to month, or None."""
     for d in year_dir.iterdir():
         if d.is_dir() and _parse_month(d.name) == month:
             return d
     return None
 
+
 def _control_code(app_name: str) -> str:
     """Derive the UAR control code from an app folder name.
 
-    Spaces are removed, then the whole string is capitalised (first letter
+    Spaces are removed then the whole string is capitalised (first letter
     upper, rest lower) to match Drata's control naming convention.
 
     'Active Directory' → 'UAR-Activedirectory'
@@ -284,95 +301,320 @@ def _control_code(app_name: str) -> str:
     return "UAR-" + app_name.replace(" ", "").capitalize()
 
 
+# ── Evidence name normalisation ───────────────────────────────────────────────
+
+# Internal scan result — raw data before name resolution.
+class ScanRaw(NamedTuple):
+    app_name:     str
+    sys_name:     Optional[str]   # None for Layout A (no system tier)
+    raw_stem:     str             # original filename stem, unchanged
+    cleaned_stem: str             # after date stripping
+    was_stripped: bool            # True if a date pattern was found and removed
+    file_path:    Path
+    year:         int
+    month:        int
+
+
+# Upload-ready item — stable evidence name resolved, ready for API calls.
+class UploadItem(NamedTuple):
+    app_name:      str
+    evidence_name: str
+    file_path:     Path
+    year:          int
+    month:         int
+
+
+# EN DASH (U+2013) appears in real filenames alongside regular hyphens.
+_DASH = r"[–\-]"
+
+
+def _clean_stem(stem: str, app_name: str) -> tuple[str, bool]:
+    """Strip known date tokens from a filename stem.
+
+    Returns (cleaned_stem, was_stripped).  was_stripped=True means at least
+    one of the three known date patterns was found and removed.
+
+    Pattern 1 — leading YYYY.M – [AppName –]:
+        '2026.4 – Synkros – Employee Roles Listing Report'
+        → 'Employee Roles Listing Report'
+
+    Pattern 2 — trailing – MMDDYYYY (separator + exactly 8 digits):
+        'LVPDBEMARK1 – Remote Desktop Users – 04142026'
+        → 'LVPDBEMARK1 – Remote Desktop Users'
+
+    Pattern 3 — trailing -MM.DD.YY(YY):
+        'Stadium-04.21.26'
+        → 'Stadium'
+    """
+    s = stem
+    n = 0
+
+    # Pattern 1: leading YYYY.M – [AppName –]
+    s, k = re.subn(
+        r"^\d{4}[.\-]\d{1,2}\s*" + _DASH + r"\s*(?:"
+        + re.escape(app_name) + r"\s*" + _DASH + r"\s*)?",
+        "", s, flags=re.IGNORECASE,
+    )
+    n += k
+
+    # Pattern 2: trailing – MMDDYYYY
+    s, k = re.subn(r"\s*" + _DASH + r"\s*\d{8}$", "", s)
+    n += k
+
+    # Pattern 3: trailing -MM.DD.YY or -MM.DD.YYYY
+    s, k = re.subn(_DASH + r"\d{2}\.\d{2}\.\d{2,4}$", "", s)
+    n += k
+
+    return s.strip(" –-"), n > 0
+
+
+def _is_date_contaminated(stem: str) -> bool:
+    """True if the stem still contains suspicious digit sequences after cleaning.
+
+    Used to decide whether to prompt the user for an unrecognised date pattern.
+    """
+    return bool(
+        re.search(r"\b\d{6,8}\b", stem)                         # standalone 6–8 digit number
+        or re.search(r"\b\d{2}[./]\d{2}[./]\d{2,4}\b", stem)   # MM.DD.YY(YY) embedded
+        or re.match(r"^\d{4}[.]\d{1,2}", stem)                  # leading YYYY.M
+    )
+
+
+def _build_evidence_name(
+    app_name: str,
+    sys_name: Optional[str],
+    cleaned_stem: str,
+) -> str:
+    """Assemble the stable evidence name from path components.
+
+    Strips redundant app/system name repetition from the cleaned stem so
+    'Stadium' doesn't become 'Stadium - Stadium'.
+
+    Examples:
+        ('Stadium',  None,       'Stadium')                    → 'Stadium'
+        ('Synkros',  None,       'Employee Roles Listing Report') → 'Synkros - Employee Roles Listing Report'
+        ('Synkros',  'Database', 'Employee Roles Listing Report') → 'Synkros - Database - Employee Roles Listing Report'
+    """
+    s = cleaned_stem
+    # Remove leading app name if the stem repeats it.
+    s = re.sub(
+        r"^" + re.escape(app_name) + r"\s*" + _DASH + r"\s*",
+        "", s, flags=re.IGNORECASE,
+    ).strip()
+    # Remove leading system name if the stem repeats it.
+    if sys_name:
+        s = re.sub(
+            r"^" + re.escape(sys_name) + r"\s*" + _DASH + r"\s*",
+            "", s, flags=re.IGNORECASE,
+        ).strip()
+    s = s.strip(" –-")
+
+    parts = [app_name]
+    if sys_name:
+        parts.append(sys_name)
+    # Append the stem only when it adds meaningful info beyond app/system name.
+    if s and s.lower() not in {app_name.lower(), (sys_name or "").lower()}:
+        parts.append(s)
+
+    return " - ".join(parts)
+
+
+def _resolve_names(
+    raw_docs: list[ScanRaw],
+    name_cache: dict[tuple, str],
+) -> list[UploadItem]:
+    """Convert raw scan results to upload-ready items, prompting for ambiguous stems.
+
+    Any filename stem that still looks date-contaminated after the three known
+    stripping patterns are applied is surfaced to the user exactly once per
+    unique (app, system, stem) combination — the cache persists across months
+    so backfill mode prompts once regardless of how many months contain that
+    file type.
+    """
+    result: list[UploadItem] = []
+
+    for doc in raw_docs:
+        cache_key = (doc.app_name, doc.sys_name or "", doc.raw_stem)
+
+        if cache_key in name_cache:
+            evidence_name = name_cache[cache_key]
+
+        elif doc.was_stripped or not _is_date_contaminated(doc.cleaned_stem):
+            # Clean or already handled — build name directly.
+            evidence_name = _build_evidence_name(doc.app_name, doc.sys_name, doc.cleaned_stem)
+            name_cache[cache_key] = evidence_name
+
+        else:
+            # Unknown date pattern — ask the user once.
+            proposed = _build_evidence_name(doc.app_name, doc.sys_name, doc.cleaned_stem)
+            print(yellow("\n⚠  Unrecognised date pattern in filename stem:"))
+            print(f"   App:      {bold(doc.app_name)}")
+            if doc.sys_name:
+                print(f"   System:   {bold(doc.sys_name)}")
+            print(f"   Stem:     {dim(doc.raw_stem)}")
+            print(f"   Proposed: {bold(proposed)}")
+            user_input = input(
+                "   Press Enter to accept, or type a stable name: "
+            ).strip()
+            evidence_name = user_input if user_input else proposed
+            name_cache[cache_key] = evidence_name
+
+        result.append(UploadItem(
+            app_name=doc.app_name,
+            evidence_name=evidence_name,
+            file_path=doc.file_path,
+            year=doc.year,
+            month=doc.month,
+        ))
+
+    return result
+
+
 # ── Folder scanner ────────────────────────────────────────────────────────────
 
-def scan_folder(root: Path, year: int, month: int) -> list[tuple[str, str, Path]]:
-    """
-    Return (app_name, evidence_name, file_path) for every document that belongs
-    to the requested month.
+def scan_folder(
+    root: Path,
+    year: int,
+    month: int,
+    *,
+    verbose: bool = True,
+) -> list[ScanRaw]:
+    """Return raw scan results for every document belonging to the requested month.
 
-    Handles two layouts automatically:
+    Handles two layouts automatically — and mixed layouts within the same app:
 
-      AppName / Year / Month / files
-        → evidence_name = filename  (e.g. 'report.csv')
+      Layout A:  AppName / Year / Month / files      (no system tier)
+      Layout B:  AppName / SystemName / Year / Month / files
 
-      AppName / SystemName / Year / Month / files
-        → evidence_name = SystemName-filename  (e.g. 'Finance-report.csv')
+    Detection: if a child of AppName/ is a 4-digit year, it's Layout A; otherwise
+    it's treated as a system name (Layout B).  Both can coexist under one app.
 
-    Month directories can be numeric ('03'), abbreviated ('Mar', 'Sept'),
-    or full names ('March', 'September').
+    verbose=True  (default, single-month mode) prints per-app diagnostics.
+    verbose=False (backfill mode) suppresses per-app output for cleaner output.
 
-    Prints a diagnostic line for every app so the caller can see exactly
-    what paths were evaluated and why documents were or weren't found.
+    Uses not d.is_dir() instead of d.is_file() to tolerate OneDrive cloud-only
+    files that report OFFLINE attribute on Windows.
     """
     if not root.is_dir():
         raise FileNotFoundError(f"Folder not found: {root}")
 
-    hits: list[tuple[str, str, Path]] = []
+    hits: list[ScanRaw] = []
 
     for app_dir in sorted(root.iterdir()):
         if not app_dir.is_dir() or app_dir.name.startswith("."):
             continue
 
-        app_hits: list[tuple[str, str, Path]] = []
+        app_hits: list[ScanRaw] = []
 
         for child in sorted(app_dir.iterdir()):
             if not child.is_dir() or child.name.startswith("."):
                 continue
 
             if _is_year(child.name):
-                # Layout: AppName / Year / Month / files
+                # ── Layout A: AppName / Year / Month / files ───────────────
                 if int(child.name) != year:
                     continue
 
                 month_dir = _find_month_dir(child, month)
                 if not month_dir:
-                    print(dim(f"  {app_dir.name} / {child.name} / ??? "
-                              f"— no folder matching month {month}"))
+                    if verbose:
+                        print(dim(
+                            f"  {app_dir.name} / {child.name} / ??? "
+                            f"— no folder matching month {month}"
+                        ))
                     continue
 
-                docs = [d for d in sorted(month_dir.iterdir())
-                        if not d.is_dir() and not d.name.startswith(".")]
+                docs = [
+                    d for d in sorted(month_dir.iterdir())
+                    if not d.is_dir() and not d.name.startswith(".")
+                ]
                 if not docs:
-                    print(dim(f"  {app_dir.name} / {child.name} / {month_dir.name} "
-                              f"— folder exists but contains no files"))
+                    if verbose:
+                        print(dim(
+                            f"  {app_dir.name} / {child.name} / {month_dir.name} "
+                            f"— folder exists but contains no files"
+                        ))
                     continue
 
                 for doc in docs:
-                    app_hits.append((app_dir.name, doc.name, doc))
+                    cleaned, stripped = _clean_stem(doc.stem, app_dir.name)
+                    app_hits.append(ScanRaw(
+                        app_name=app_dir.name,
+                        sys_name=None,
+                        raw_stem=doc.stem,
+                        cleaned_stem=cleaned,
+                        was_stripped=stripped,
+                        file_path=doc,
+                        year=year,
+                        month=month,
+                    ))
 
             else:
-                # Layout: AppName / SystemName / Year / Month / files
+                # ── Layout B: AppName / SystemName / Year / Month / files ──
                 sys_dir = child
                 year_dir = sys_dir / str(year)
 
                 if not year_dir.is_dir():
-                    print(dim(f"  {app_dir.name} / {sys_dir.name} / {year} "
-                              f"— year folder not found"))
+                    if verbose:
+                        print(dim(
+                            f"  {app_dir.name} / {sys_dir.name} / {year} "
+                            f"— year folder not found"
+                        ))
                     continue
 
                 month_dir = _find_month_dir(year_dir, month)
                 if not month_dir:
-                    print(dim(f"  {app_dir.name} / {sys_dir.name} / {year} / ??? "
-                              f"— no folder matching month {month}"))
+                    if verbose:
+                        print(dim(
+                            f"  {app_dir.name} / {sys_dir.name} / {year} / ??? "
+                            f"— no folder matching month {month}"
+                        ))
                     continue
 
-                docs = [d for d in sorted(month_dir.iterdir())
-                        if not d.is_dir() and not d.name.startswith(".")]
+                docs = [
+                    d for d in sorted(month_dir.iterdir())
+                    if not d.is_dir() and not d.name.startswith(".")
+                ]
                 if not docs:
-                    print(dim(f"  {app_dir.name} / {sys_dir.name} / {year} / {month_dir.name} "
-                              f"— folder exists but contains no files"))
+                    if verbose:
+                        print(dim(
+                            f"  {app_dir.name} / {sys_dir.name} / {year} / {month_dir.name} "
+                            f"— folder exists but contains no files"
+                        ))
                     continue
 
                 for doc in docs:
-                    app_hits.append((app_dir.name, f"{sys_dir.name}-{doc.name}", doc))
+                    cleaned, stripped = _clean_stem(doc.stem, app_dir.name)
+                    app_hits.append(ScanRaw(
+                        app_name=app_dir.name,
+                        sys_name=sys_dir.name,
+                        raw_stem=doc.stem,
+                        cleaned_stem=cleaned,
+                        was_stripped=stripped,
+                        file_path=doc,
+                        year=year,
+                        month=month,
+                    ))
 
-        if app_hits:
+        if app_hits and verbose:
             print(green(f"  {app_dir.name} → {len(app_hits)} file(s) queued"))
 
         hits.extend(app_hits)
 
     return hits
+
+
+# ── Month iteration ───────────────────────────────────────────────────────────
+
+def iter_months(sy: int, sm: int, ey: int, em: int):
+    """Yield (year, month) pairs from (sy, sm) to (ey, em) inclusive."""
+    year, month = sy, sm
+    while (year, month) <= (ey, em):
+        yield year, month
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
 
 
 # ── Interactive helpers ───────────────────────────────────────────────────────
@@ -384,21 +626,22 @@ def ask(label: str, default: str = "", secret: bool = False) -> str:
     return value or default
 
 
-def ask_month() -> tuple[int, int]:
-    today = datetime.date.today()
+def ask_month(label: str = "Month to process") -> tuple[int, int]:
+    """Prompt for a month; accepts YYYY-MM or YYYY-MonthName formats."""
+    today   = datetime.date.today()
     default = f"{today.year}-{today.month:02d}"
-    print(f"\n{bold('Month to process')}  (YYYY-MM or YYYY-MonthName, default = current month)")
+    print(f"\n{bold(label)}  (YYYY-MM or YYYY-MonthName, default = current month)")
     print(f"  {dim('e.g.  2026-04  |  2026-Apr  |  2026-April')}")
-    raw = input(f"  → ").strip() or default
+    raw = input("  → ").strip() or default
 
-    # Try strict numeric YYYY-MM first
+    # Strict numeric YYYY-MM.
     try:
         dt = datetime.datetime.strptime(raw, "%Y-%m")
         return dt.year, dt.month
     except ValueError:
         pass
 
-    # Try YYYY-<anything in MONTH_MAP> — same names the folders themselves use
+    # YYYY-<anything in MONTH_MAP>.
     parts = raw.split("-", 1)
     if len(parts) == 2 and parts[0].isdigit():
         month = _parse_month(parts[1])
@@ -414,13 +657,28 @@ def ask_month() -> tuple[int, int]:
 
 BANNER = f"""
 {cyan('╔══════════════════════════════════════════════╗')}
-{cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v1.0')}              {cyan('║')}
+{cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v2.0')}              {cyan('║')}
 {cyan('║')}   Automates monthly evidence → {bold('UAR controls')}  {cyan('║')}
 {cyan('╚══════════════════════════════════════════════╝')}
 """
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Drata Evidence Uploader v2.0",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Single month:  python upload_evidence.py\n"
+            "Backfill:      python upload_evidence.py --backfill"
+        ),
+    )
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Upload evidence for a configurable date range (one-time historical backfill)",
+    )
+    args = parser.parse_args()
+
     print(BANNER)
 
     # ── Config ────────────────────────────────────────────────────────────────
@@ -429,38 +687,84 @@ def main() -> None:
     workspace_id = ask("Workspace ID")
     root_path    = Path.cwd()
 
-    year, month  = ask_month()
-    month_label  = f"{year}-{month:02d}"
-    last_day     = calendar.monthrange(year, month)[1]  # [1] = number of days in month
-    filed_at     = f"{year}-{month:02d}-{last_day}"
-
-    # Expiry = 1st of the following month (e.g. March evidence expires April 1)
-    exp_year, exp_month = (year + 1, 1) if month == 12 else (year, month + 1)
-    renewal_date = f"{exp_year}-{exp_month:02d}-01"
-
-    print(f"\n  Period   : {bold(month_label)}")
-    print(f"  Filed at : {dim(filed_at)}")
-    print(f"  Expires  : {dim(renewal_date)}")
-    print(f"  Root     : {dim(str(root_path))}")
+    # ── Date range ────────────────────────────────────────────────────────────
+    if args.backfill:
+        print(f"\n{bold('─── Backfill range ──────────────────────────────')}")
+        print(dim("  Both months inclusive.  Enter in YYYY-MM format."))
+        start_year, start_month = ask_month("Start month")
+        end_year,   end_month   = ask_month("End month")
+        month_list = list(iter_months(start_year, start_month, end_year, end_month))
+        print(
+            f"\n  Range : {bold(f'{start_year}-{start_month:02d}')} → "
+            f"{bold(f'{end_year}-{end_month:02d}')}  "
+            f"{dim(f'({len(month_list)} months)')}"
+        )
+        print(f"  Root  : {dim(str(root_path))}")
+    else:
+        year, month = ask_month()
+        month_list  = [(year, month)]
+        print(f"\n  Period : {bold(f'{year}-{month:02d}')}")
+        print(f"  Root   : {dim(str(root_path))}")
 
     # ── Scan ──────────────────────────────────────────────────────────────────
-    print(f"\n{bold('─── Scanning folder ─────────────────────────────')}\n")
-    try:
-        documents = scan_folder(root_path, year, month)
-    except FileNotFoundError as exc:
-        print(red(f"Error: {exc}"))
-        sys.exit(1)
+    print(f"\n{bold('─── Scanning ────────────────────────────────────')}\n")
+    all_raw: list[ScanRaw] = []
 
-    if not documents:
-        print(yellow(f"No documents found for {month_label}.  Nothing to upload."))
+    for (y, m) in month_list:
+        try:
+            found = scan_folder(root_path, y, m, verbose=not args.backfill)
+        except FileNotFoundError as exc:
+            print(red(f"Error: {exc}"))
+            sys.exit(1)
+
+        if args.backfill and found:
+            print(dim(f"  {y}-{m:02d}: {len(found)} file(s)"))
+
+        all_raw.extend(found)
+
+    if not all_raw:
+        if args.backfill:
+            print(yellow("No documents found in the specified range.  Nothing to upload."))
+        else:
+            y, m = month_list[0]
+            print(yellow(f"No documents found for {y}-{m:02d}.  Nothing to upload."))
         sys.exit(0)
 
-    for app, evidence_name, doc in documents:
-        code = _control_code(app)
-        print(f"  {green('●')} {bold(evidence_name)}  {dim(f'→ {code}')}")
-        print(f"      {dim(doc.name)}")
+    # ── Name resolution ───────────────────────────────────────────────────────
+    # All interactive prompts for ambiguous stems happen here, before any upload.
+    if args.backfill:
+        print(f"\n{bold('─── Resolving evidence names ────────────────────')}\n")
+    name_cache: dict[tuple, str] = {}
+    documents = _resolve_names(all_raw, name_cache)
 
-    confirm = input(f"\n{bold('Upload these')} {len(documents)} document(s)? [Y/n]: ").strip().lower()
+    # ── Upload plan ───────────────────────────────────────────────────────────
+    print(f"\n{bold('─── Upload plan ─────────────────────────────────')}\n")
+
+    if args.backfill:
+        for (y, m), grp in groupby(documents, key=lambda d: (d.year, d.month)):
+            items = list(grp)
+            print(f"  {cyan(f'{y}-{m:02d}')}  {dim(f'{len(items)} file(s)')}")
+            for item in items:
+                print(
+                    f"    {green('●')} {bold(item.evidence_name)}  "
+                    f"{dim(f'→ {_control_code(item.app_name)}')}"
+                )
+    else:
+        for item in documents:
+            print(
+                f"  {green('●')} {bold(item.evidence_name)}  "
+                f"{dim(f'→ {_control_code(item.app_name)}')}"
+            )
+            print(f"      {dim(item.file_path.name)}")
+
+    total = len(documents)
+    if args.backfill:
+        months_with_files = len(set((d.year, d.month) for d in documents))
+        prompt_label = f"Upload {total} document(s) across {months_with_files} month(s)?"
+    else:
+        prompt_label = f"Upload these {total} document(s)?"
+
+    confirm = input(f"\n{bold(prompt_label)} [Y/n]: ").strip().lower()
     if confirm == "n":
         print("Aborted.")
         sys.exit(0)
@@ -470,7 +774,7 @@ def main() -> None:
 
     print(f"\n{bold('─── Resolving IDs ───────────────────────────────')}\n")
 
-    # Owner
+    # Owner lookup — email → numeric ID required by the API.
     owner_email = ask("Owner email (evidence will be assigned to this person)")
     print(f"  Looking up {bold(owner_email)}... ", end="", flush=True)
     try:
@@ -483,7 +787,7 @@ def main() -> None:
     if not owner_id:
         print(yellow("NOT FOUND"))
         print(yellow(f"  '{owner_email}' was not found in Drata users."))
-        print(dim( "  Check that the address matches exactly what's in Drata → Settings → People."))
+        print(dim("  Check that the address matches exactly what's in Drata → Settings → People."))
         skip = input(f"  {bold('Continue without assigning an owner?')} [y/N]: ").strip().lower()
         if skip != "y":
             print("Aborted.")
@@ -496,15 +800,35 @@ def main() -> None:
     print(f"\n{bold('─── Uploading ───────────────────────────────────')}\n")
     created = updated = failed = 0
 
-    # Cache control IDs so we only hit the API once per unique app name
+    # Cache control IDs so each app only hits the API once per run.
     control_cache: dict[str, Optional[int]] = {}
 
-    for app, evidence_name, doc_path in documents:
-        code = _control_code(app)
-        print(f"  {bold(evidence_name)}  {dim(f'[{code}]')}")
-        print(f"  {dim('file:')} {doc_path.name}")
+    # Cache evidence entry IDs discovered or created this run.
+    # Once we know an entry exists we skip the find_evidence GET on subsequent
+    # months and go straight to update — cuts API calls ~50% in backfill mode.
+    entry_cache: dict[str, int] = {}
 
-        # Resolve this app's control (cached after first lookup)
+    current_label: Optional[str] = None
+
+    for item in documents:
+        # Month header in backfill mode.
+        if args.backfill:
+            label = f"{item.year}-{item.month:02d}"
+            if label != current_label:
+                current_label = label
+                print(f"  {cyan('[' + label + ']')}")
+
+        # Dates vary per month — compute fresh for every item.
+        last_day     = calendar.monthrange(item.year, item.month)[1]
+        filed_at     = f"{item.year}-{item.month:02d}-{last_day}"
+        exp_year     = item.year + 1 if item.month == 12 else item.year
+        exp_month    = 1             if item.month == 12 else item.month + 1
+        renewal_date = f"{exp_year}-{exp_month:02d}-01"
+
+        code = _control_code(item.app_name)
+        print(f"  {bold(item.evidence_name)}  {dim(f'[{code}]')}")
+
+        # Control lookup (cached per unique app name).
         if code not in control_cache:
             print(f"  {dim('→')} Looking up control {code}... ", end="", flush=True)
             try:
@@ -527,21 +851,41 @@ def main() -> None:
             continue
 
         try:
-            existing = client.find_evidence(evidence_name)
-
-            if existing:
-                ev_id = existing["id"]
-                print(f"  {dim('→')} Found entry (ID {ev_id}) — uploading new version... ", end="", flush=True)
-                client.update_evidence(ev_id, doc_path, filed_at, renewal_date, owner_id)
+            if item.evidence_name in entry_cache:
+                # Entry confirmed to exist this run — skip the GET.
+                ev_id = entry_cache[item.evidence_name]
+                print(
+                    f"  {dim('→')} Uploading new version (ID {ev_id})... ",
+                    end="", flush=True,
+                )
+                client.update_evidence(ev_id, item.file_path, filed_at, renewal_date, owner_id)
                 print(green("UPDATED"))
                 updated += 1
+
             else:
-                print(f"  {dim('→')} No existing entry — creating... ", end="", flush=True)
-                result = client.create_evidence(
-                    evidence_name, doc_path, filed_at, renewal_date, [control_id], owner_id
-                )
-                print(green(f"CREATED (ID {result['id']})"))
-                created += 1
+                existing = client.find_evidence(item.evidence_name)
+
+                if existing:
+                    ev_id = existing["id"]
+                    entry_cache[item.evidence_name] = ev_id
+                    print(
+                        f"  {dim('→')} Found entry (ID {ev_id}) — uploading new version... ",
+                        end="", flush=True,
+                    )
+                    client.update_evidence(ev_id, item.file_path, filed_at, renewal_date, owner_id)
+                    print(green("UPDATED"))
+                    updated += 1
+
+                else:
+                    print(f"  {dim('→')} No existing entry — creating... ", end="", flush=True)
+                    result = client.create_evidence(
+                        item.evidence_name, item.file_path,
+                        filed_at, renewal_date, [control_id], owner_id,
+                    )
+                    ev_id = result["id"]
+                    entry_cache[item.evidence_name] = ev_id
+                    print(green(f"CREATED (ID {ev_id})"))
+                    created += 1
 
         except DrataError as exc:
             print(red("FAILED"))
@@ -549,7 +893,7 @@ def main() -> None:
             failed += 1
         except requests.Timeout:
             print(red("TIMED OUT"))
-            print(red("  The request took too long. Check your connection and try again."))
+            print(red("  The request took too long.  Check your connection and try again."))
             failed += 1
         except OSError as exc:
             print(red("FAILED"))
@@ -560,6 +904,9 @@ def main() -> None:
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(bold("─── Summary ─────────────────────────────────────\n"))
+    if args.backfill:
+        months_processed = len(set((d.year, d.month) for d in documents))
+        print(f"  {dim('Months processed:')} {months_processed}")
     print(f"  {green('Created:')} {created}")
     print(f"  {cyan('Updated:')} {updated}")
     print(f"  {(red if failed else dim)('Failed:')}  {failed}\n")
