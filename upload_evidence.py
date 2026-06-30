@@ -192,28 +192,34 @@ class DrataClient:
     ) -> dict:
         """Create a new Evidence Library entry and upload the file as its first version.
 
-        fields is a list of tuples (not a dict) because multipart/form-data
-        allows repeated keys — the only way to send an array like controlIds
-        over this content type without serialising to JSON.
+        All fields (text and file) are passed through the files= parameter as a list
+        of tuples so that requests produces a single, well-formed multipart body.
+        Text fields use (None, value) — no filename — which is equivalent to data= fields
+        but avoids the files+data merge that can silently drop the file part on Windows.
+        controlIds appears multiple times (one tuple per ID) because multipart/form-data
+        is the only way to send an array without serialising to JSON.
         """
-        fields = [
-            ("name",                name),
-            ("filedAt",             filed_at),
-            ("renewalScheduleType", "CUSTOM"),
-            ("renewalDate",         renewal_date),
+        file_bytes = file_path.read_bytes()
+        if not file_bytes:
+            raise DrataError(f"File is empty or not synced from OneDrive: {file_path.name}")
+
+        parts: list = [
+            ("name",                (None, name)),
+            ("filedAt",             (None, filed_at)),
+            ("renewalScheduleType", (None, "CUSTOM")),
+            ("renewalDate",         (None, renewal_date)),
         ]
         if owner_id is not None:
-            fields.append(("ownerId", str(owner_id)))
+            parts.append(("ownerId", (None, str(owner_id))))
         for cid in control_ids:
-            fields.append(("controlIds", str(cid)))
+            parts.append(("controlIds", (None, str(cid))))
+        parts.append(("file", (file_path.name, file_bytes, "application/octet-stream")))
 
-        with open(file_path, "rb") as fh:
-            resp = self._s.post(
-                f"{self._base}/evidence-library",
-                files={"file": (file_path.name, fh)},
-                data=fields,
-                timeout=120,
-            )
+        resp = self._s.post(
+            f"{self._base}/evidence-library",
+            files=parts,
+            timeout=120,
+        )
         self._check(resp)
         return resp.json()
 
@@ -231,21 +237,24 @@ class DrataClient:
         supplied value (including an empty array) as a full replacement, which
         would silently drop control mappings set elsewhere in Drata.
         """
-        data: dict = {
-            "filedAt":             filed_at,
-            "renewalScheduleType": "CUSTOM",
-            "renewalDate":         renewal_date,
-        }
-        if owner_id is not None:
-            data["ownerId"] = str(owner_id)
+        file_bytes = file_path.read_bytes()
+        if not file_bytes:
+            raise DrataError(f"File is empty or not synced from OneDrive: {file_path.name}")
 
-        with open(file_path, "rb") as fh:
-            resp = self._s.put(
-                f"{self._base}/evidence-library/{evidence_id}",
-                files={"file": (file_path.name, fh)},
-                data=data,
-                timeout=120,
-            )
+        parts: list = [
+            ("filedAt",             (None, filed_at)),
+            ("renewalScheduleType", (None, "CUSTOM")),
+            ("renewalDate",         (None, renewal_date)),
+        ]
+        if owner_id is not None:
+            parts.append(("ownerId", (None, str(owner_id))))
+        parts.append(("file", (file_path.name, file_bytes, "application/octet-stream")))
+
+        resp = self._s.put(
+            f"{self._base}/evidence-library/{evidence_id}",
+            files=parts,
+            timeout=120,
+        )
         self._check(resp)
         return resp.json()
 
