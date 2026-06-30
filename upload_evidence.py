@@ -181,6 +181,30 @@ class DrataClient:
                 return item
         return None
 
+    def find_evidence_by_stem(self, cleaned_stem: str, control_code: str) -> Optional[dict]:
+        """Fallback lookup for entries created by an older version of this script.
+
+        Older versions used raw filenames as evidence names (e.g.
+        "Application-2026.5 – Synkros – Roles Permissions Listing Report.xlsx").
+        The cleaned stem — the date-stripped report name — appears as a substring
+        in both old and new names, so we can still identify the right entry.
+
+        Fetches all evidence with controls expanded and matches entries where:
+          1. cleaned_stem is a substring of the entry name (case-insensitive)
+          2. The entry is linked to the expected control code (e.g. UAR-Synkros)
+        """
+        if not cleaned_stem or len(cleaned_stem) < 5:
+            return None
+        for item in self._paginate(
+            f"{self._base}/evidence-library",
+            {"size": 200, "expand[]": "controls"},
+        ):
+            if cleaned_stem.lower() not in item.get("name", "").lower():
+                continue
+            if any(c.get("code") == control_code for c in item.get("controls", [])):
+                return item
+        return None
+
     def create_evidence(
         self,
         name: str,
@@ -331,6 +355,7 @@ class UploadItem(NamedTuple):
     file_path:     Path
     year:          int
     month:         int
+    cleaned_stem:  str   # date-stripped report name; used for fallback lookup
 
 
 # EN DASH (U+2013) appears in real filenames alongside regular hyphens.
@@ -509,6 +534,7 @@ def _resolve_names(
             file_path=doc.file_path,
             year=doc.year,
             month=doc.month,
+            cleaned_stem=doc.cleaned_stem,
         ))
 
     return result
@@ -1020,6 +1046,18 @@ def main() -> None:
 
             else:
                 existing = client.find_evidence(item.evidence_name)
+
+                if not existing and item.cleaned_stem:
+                    # Fallback: entries created by older script versions used raw
+                    # filenames as evidence names. The cleaned stem still appears
+                    # as a substring in those old names, so we can find them.
+                    existing = client.find_evidence_by_stem(
+                        item.cleaned_stem, _control_code(item.app_name)
+                    )
+                    if existing:
+                        print(dim(
+                            f"  (matched existing entry '{existing['name']}' by stem)"
+                        ))
 
                 if existing:
                     ev_id = existing["id"]
