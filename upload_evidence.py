@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Drata Evidence Uploader  v2.2
+Drata Evidence Uploader  v2.3
 ------------------------------
 Every month new documents land in a folder tree maintained by the compliance
 team.  This script walks that tree, finds the documents for the target month,
@@ -241,34 +241,25 @@ class DrataClient:
         control_ids: list[int],
         owner_id: Optional[int],
     ) -> dict:
-        """Create a new Evidence Library entry and upload the file as its first version.
+        """Create a new Evidence Library entry, then upload the file as its first version.
 
-        All fields (text and file) are passed through the files= parameter as a list
-        of tuples so that requests produces a single, well-formed multipart body.
-        Text fields use (None, value) — no filename — which is equivalent to data= fields
-        but avoids the files+data merge that can silently drop the file part on Windows.
-        controlIds appears multiple times (one tuple per ID) because multipart/form-data
-        is the only way to send an array without serialising to JSON.
+        WORKAROUND for a confirmed Drata API bug: POST /evidence-library does not
+        recognise a multipart file part as a valid artifact source — it always
+        rejects filedAt/renewalScheduleType with "ForbiddenWithoutArtifactSource"
+        (HTTP 400, code 10020) even with a well-formed file attached. Verified
+        directly against the live API with curl, no client library involved: the
+        identical file part is rejected by POST but correctly recognised by PUT
+        (which proceeds to a real, unrelated validation error instead). So: create
+        a bare entry with POST (no file — confirmed to work), then attach the file
+        via update_evidence (PUT — confirmed to work).
 
-        The file's Content-Type is guessed from its extension (e.g. .xlsx ->
-        the real Office Open XML MIME type). A generic "application/octet-stream"
-        for every file regardless of type risks the API routing it through the
-        wrong content validator.
+        If attaching the file fails, the bare entry is deleted so a retry starts
+        clean instead of leaving an empty orphan entry that a same-day-run guard
+        would otherwise mistake for a completed upload.
         """
-        file_bytes = _read_file_checked(file_path)
-        content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-
-        parts: list = [
-            ("name",                (None, name)),
-            ("filedAt",             (None, filed_at)),
-            ("renewalScheduleType", (None, "CUSTOM")),
-            ("renewalDate",         (None, renewal_date)),
-        ]
-        if owner_id is not None:
-            parts.append(("ownerId", (None, str(owner_id))))
+        parts: list = [("name", (None, name))]
         for cid in control_ids:
             parts.append(("controlIds", (None, str(cid))))
-        parts.append(("file", (file_path.name, file_bytes, content_type)))
 
         resp = self._s.post(
             f"{self._base}/evidence-library",
@@ -276,7 +267,27 @@ class DrataClient:
             timeout=120,
         )
         self._check(resp)
-        return resp.json()
+        result = resp.json()
+
+        try:
+            self.update_evidence(result["id"], file_path, filed_at, renewal_date, owner_id)
+        except Exception:
+            try:
+                self.delete_evidence(result["id"])
+            except Exception:
+                pass
+            raise
+
+        return result
+
+    def delete_evidence(self, evidence_id: int) -> None:
+        """Delete an Evidence Library entry.
+
+        Used by create_evidence() to roll back the bare entry it creates if
+        attaching the file subsequently fails.
+        """
+        resp = self._s.delete(f"{self._base}/evidence-library/{evidence_id}", timeout=30)
+        self._check(resp)
 
     def update_evidence(
         self,
@@ -860,7 +871,7 @@ def ask_month(label: str = "Month to process") -> tuple[int, int]:
 
 BANNER = f"""
 {cyan('╔══════════════════════════════════════════════╗')}
-{cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v2.2')}              {cyan('║')}
+{cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v2.3')}              {cyan('║')}
 {cyan('║')}   Automates monthly evidence → {bold('UAR controls')}  {cyan('║')}
 {cyan('╚══════════════════════════════════════════════╝')}
 """
@@ -868,7 +879,7 @@ BANNER = f"""
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Drata Evidence Uploader v2.2",
+        description="Drata Evidence Uploader v2.3",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Single month:  python upload_evidence.py\n"
