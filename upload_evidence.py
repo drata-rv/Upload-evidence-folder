@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Drata Evidence Uploader  v2.3
+Drata Evidence Uploader  v2.4
 ------------------------------
 Every month new documents land in a folder tree maintained by the compliance
 team.  This script walks that tree, finds the documents for the target month,
@@ -112,6 +112,38 @@ DRATA_BASE = "https://public-api.drata.com/public/v2"
 
 class DrataError(Exception):
     pass
+
+
+# mimetypes.guess_type() consults the OS's MIME database, which on Windows
+# reads HKEY_CLASSES_ROOT. Third-party software (commonly Excel being set as
+# the default handler for .csv) can register .csv there under the SAME MIME
+# type as .xls ("application/vnd.ms-excel") instead of "text/csv". Drata's
+# API validates the declared Content-Type against the file extension and
+# rejects a mismatch (HTTP 400 "Mismatch between file extension and file
+# format", code 28310) — confirmed live: a plain, valid CSV failed until the
+# declared type was corrected to text/csv. Hardcode the extensions this
+# script actually handles so upload behaviour doesn't depend on a given
+# Windows machine's registry state.
+_MIME_OVERRIDES = {
+    ".csv":  "text/csv",
+    ".xls":  "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".doc":  "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pdf":  "application/pdf",
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+
+def _guess_content_type(filename: str) -> str:
+    """Return the correct MIME type for a filename without trusting the OS's
+    (possibly mis-registered) MIME database for known extensions."""
+    ext = Path(filename).suffix.lower()
+    if ext in _MIME_OVERRIDES:
+        return _MIME_OVERRIDES[ext]
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 
 def _read_file_checked(file_path: Path) -> bytes:
@@ -304,7 +336,7 @@ class DrataClient:
         would silently drop control mappings set elsewhere in Drata.
         """
         file_bytes = _read_file_checked(file_path)
-        content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        content_type = _guess_content_type(file_path.name)
 
         parts: list = [
             ("filedAt",             (None, filed_at)),
@@ -871,7 +903,7 @@ def ask_month(label: str = "Month to process") -> tuple[int, int]:
 
 BANNER = f"""
 {cyan('╔══════════════════════════════════════════════╗')}
-{cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v2.3')}              {cyan('║')}
+{cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v2.4')}              {cyan('║')}
 {cyan('║')}   Automates monthly evidence → {bold('UAR controls')}  {cyan('║')}
 {cyan('╚══════════════════════════════════════════════╝')}
 """
@@ -879,7 +911,7 @@ BANNER = f"""
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Drata Evidence Uploader v2.3",
+        description="Drata Evidence Uploader v2.4",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Single month:  python upload_evidence.py\n"
