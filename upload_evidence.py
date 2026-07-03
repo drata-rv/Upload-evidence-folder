@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Drata Evidence Uploader  v2.4
+Drata Evidence Uploader  v2.5
 ------------------------------
 Every month new documents land in a folder tree maintained by the compliance
 team.  This script walks that tree, finds the documents for the target month,
@@ -225,10 +225,17 @@ class DrataClient:
         return None
 
     def find_evidence(self, name: str) -> Optional[dict]:
-        """Return the first evidence entry whose name matches exactly, or None."""
-        # The API supports name filtering — use it to narrow the scan.
+        """Return the first evidence entry whose name matches exactly, or None.
+
+        Expands renewalSchemaAndVersions so the caller can tell a real
+        uploaded file apart from an empty bucket/shell entry (see
+        _has_real_file) — needed because a bare entry left behind by a
+        failed create_evidence() rollback would otherwise look identical
+        to a genuinely completed upload.
+        """
         for item in self._paginate(
-            f"{self._base}/evidence-library", {"size": 50, "name": name}
+            f"{self._base}/evidence-library",
+            {"size": 50, "name": name, "expand[]": "renewalSchemaAndVersions"},
         ):
             if item.get("name") == name:
                 return item
@@ -257,7 +264,7 @@ class DrataClient:
             item
             for item in self._paginate(
                 f"{self._base}/evidence-library",
-                {"size": 200, "expand[]": "controls"},
+                {"size": 200, "expand[]": ["controls", "renewalSchemaAndVersions"]},
             )
             if cleaned_stem.lower() in item.get("name", "").lower()
             and any(c.get("code") == control_code for c in item.get("controls", []))
@@ -306,8 +313,14 @@ class DrataClient:
         except Exception:
             try:
                 self.delete_evidence(result["id"])
-            except Exception:
-                pass
+            except Exception as cleanup_exc:
+                print(red(
+                    f"  WARNING: created bare entry (ID {result['id']}, name '{name}') "
+                    f"but failed to roll it back after the file attach also failed: "
+                    f"{cleanup_exc}. This entry has no file and needs manual cleanup "
+                    f"in Drata, or it will be mistaken for a completed upload on a "
+                    f"same-day re-run."
+                ))
             raise
 
         return result
@@ -633,13 +646,32 @@ def _updated_today(updated_at: Optional[str]) -> bool:
     """True if an evidence entry's updatedAt timestamp falls on today's date.
 
     Used to make a same-day re-run safe: an entry that already received a
-    version today (e.g. from an earlier attempt that partly failed) is left
-    alone instead of being uploaded to a second time, which would otherwise
-    add a redundant duplicate version for every file that already succeeded.
+    real version today is left alone instead of being uploaded to a second
+    time, which would otherwise add a redundant duplicate version for every
+    file that already succeeded. Combine with _has_real_file() — updatedAt
+    alone can't tell a completed upload apart from a bare shell entry.
     """
     if not updated_at:
         return False
     return updated_at[:10] == datetime.date.today().isoformat()
+
+
+def _has_real_file(item: dict) -> bool:
+    """True if an evidence entry's current version is a real uploaded file,
+    not an empty bucket/shell (version type "NONE").
+
+    A bare entry created by create_evidence()'s POST step has exactly this
+    shell shape — if the follow-up PUT to attach the file then fails AND
+    the rollback delete also fails (permissions, a transient error, etc.),
+    the bare shell is left behind with a real, same-day updatedAt timestamp.
+    Without this check, _updated_today() alone would mistake that empty
+    shell for a completed upload and skip it forever. Requires the item to
+    have been fetched with expand[]=renewalSchemaAndVersions.
+    """
+    for v in item.get("versions", []):
+        if v.get("current"):
+            return v.get("type") not in (None, "", "NONE")
+    return False
 
 
 def scan_folder(
@@ -903,7 +935,7 @@ def ask_month(label: str = "Month to process") -> tuple[int, int]:
 
 BANNER = f"""
 {cyan('╔══════════════════════════════════════════════╗')}
-{cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v2.4')}              {cyan('║')}
+{cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v2.5')}              {cyan('║')}
 {cyan('║')}   Automates monthly evidence → {bold('UAR controls')}  {cyan('║')}
 {cyan('╚══════════════════════════════════════════════╝')}
 """
@@ -911,7 +943,7 @@ BANNER = f"""
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Drata Evidence Uploader v2.4",
+        description="Drata Evidence Uploader v2.5",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Single month:  python upload_evidence.py\n"
@@ -1149,7 +1181,7 @@ def main() -> None:
                     ev_id = existing["id"]
                     entry_cache[item.evidence_name] = ev_id
 
-                    if _updated_today(existing.get("updatedAt")):
+                    if _updated_today(existing.get("updatedAt")) and _has_real_file(existing):
                         print(yellow(
                             f"  {dim('→')} Entry (ID {ev_id}) already has a version from "
                             f"today — skipping to avoid a duplicate."
