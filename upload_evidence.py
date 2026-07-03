@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Drata Evidence Uploader  v2.1
+Drata Evidence Uploader  v2.2
 ------------------------------
 Every month new documents land in a folder tree maintained by the compliance
 team.  This script walks that tree, finds the documents for the target month,
@@ -46,6 +46,7 @@ import argparse
 import getpass
 import calendar
 import datetime
+import mimetypes
 from itertools import groupby
 from pathlib import Path
 from typing import NamedTuple, Optional
@@ -111,6 +112,26 @@ DRATA_BASE = "https://public-api.drata.com/public/v2"
 
 class DrataError(Exception):
     pass
+
+
+def _read_file_checked(file_path: Path) -> bytes:
+    """Read a file's full contents, catching a truncated/partial OneDrive read.
+
+    OneDrive "Files On-Demand" cloud-only files can occasionally yield fewer
+    bytes than their reported size instead of raising an error or fully
+    hydrating. Sending that partial content to the API produces a confusing
+    generic rejection instead of a clear local error, so check it here first.
+    """
+    file_bytes = file_path.read_bytes()
+    on_disk_size = file_path.stat().st_size
+    if not file_bytes:
+        raise DrataError(f"File is empty or not synced from OneDrive: {file_path.name}")
+    if len(file_bytes) != on_disk_size:
+        raise DrataError(
+            f"Read {len(file_bytes)} of {on_disk_size} bytes — file may still be "
+            f"syncing from OneDrive: {file_path.name}"
+        )
+    return file_bytes
 
 
 class DrataClient:
@@ -228,10 +249,14 @@ class DrataClient:
         but avoids the files+data merge that can silently drop the file part on Windows.
         controlIds appears multiple times (one tuple per ID) because multipart/form-data
         is the only way to send an array without serialising to JSON.
+
+        The file's Content-Type is guessed from its extension (e.g. .xlsx ->
+        the real Office Open XML MIME type). A generic "application/octet-stream"
+        for every file regardless of type risks the API routing it through the
+        wrong content validator.
         """
-        file_bytes = file_path.read_bytes()
-        if not file_bytes:
-            raise DrataError(f"File is empty or not synced from OneDrive: {file_path.name}")
+        file_bytes = _read_file_checked(file_path)
+        content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
 
         parts: list = [
             ("name",                (None, name)),
@@ -243,7 +268,7 @@ class DrataClient:
             parts.append(("ownerId", (None, str(owner_id))))
         for cid in control_ids:
             parts.append(("controlIds", (None, str(cid))))
-        parts.append(("file", (file_path.name, file_bytes, "application/octet-stream")))
+        parts.append(("file", (file_path.name, file_bytes, content_type)))
 
         resp = self._s.post(
             f"{self._base}/evidence-library",
@@ -267,9 +292,8 @@ class DrataClient:
         supplied value (including an empty array) as a full replacement, which
         would silently drop control mappings set elsewhere in Drata.
         """
-        file_bytes = file_path.read_bytes()
-        if not file_bytes:
-            raise DrataError(f"File is empty or not synced from OneDrive: {file_path.name}")
+        file_bytes = _read_file_checked(file_path)
+        content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
 
         parts: list = [
             ("filedAt",             (None, filed_at)),
@@ -278,7 +302,7 @@ class DrataClient:
         ]
         if owner_id is not None:
             parts.append(("ownerId", (None, str(owner_id))))
-        parts.append(("file", (file_path.name, file_bytes, "application/octet-stream")))
+        parts.append(("file", (file_path.name, file_bytes, content_type)))
 
         resp = self._s.put(
             f"{self._base}/evidence-library/{evidence_id}",
@@ -562,6 +586,19 @@ def _stem_month(raw_stem: str) -> Optional[int]:
     return None
 
 
+def _updated_today(updated_at: Optional[str]) -> bool:
+    """True if an evidence entry's updatedAt timestamp falls on today's date.
+
+    Used to make a same-day re-run safe: an entry that already received a
+    version today (e.g. from an earlier attempt that partly failed) is left
+    alone instead of being uploaded to a second time, which would otherwise
+    add a redundant duplicate version for every file that already succeeded.
+    """
+    if not updated_at:
+        return False
+    return updated_at[:10] == datetime.date.today().isoformat()
+
+
 def scan_folder(
     root: Path,
     year: int,
@@ -823,7 +860,7 @@ def ask_month(label: str = "Month to process") -> tuple[int, int]:
 
 BANNER = f"""
 {cyan('╔══════════════════════════════════════════════╗')}
-{cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v2.1')}              {cyan('║')}
+{cyan('║')}   {bold('Drata Evidence Uploader')}  {dim('v2.2')}              {cyan('║')}
 {cyan('║')}   Automates monthly evidence → {bold('UAR controls')}  {cyan('║')}
 {cyan('╚══════════════════════════════════════════════╝')}
 """
@@ -831,7 +868,7 @@ BANNER = f"""
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Drata Evidence Uploader v2.0",
+        description="Drata Evidence Uploader v2.2",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Single month:  python upload_evidence.py\n"
@@ -986,7 +1023,7 @@ def main() -> None:
 
     # ── Upload loop ───────────────────────────────────────────────────────────
     print(f"\n{bold('─── Uploading ───────────────────────────────────')}\n")
-    created = updated = failed = 0
+    created = updated = failed = skipped_already_done = 0
 
     # Cache control IDs so each app only hits the API once per run.
     control_cache: dict[str, Optional[int]] = {}
@@ -1068,13 +1105,21 @@ def main() -> None:
                 if existing:
                     ev_id = existing["id"]
                     entry_cache[item.evidence_name] = ev_id
-                    print(
-                        f"  {dim('→')} Found entry (ID {ev_id}) — uploading new version... ",
-                        end="", flush=True,
-                    )
-                    client.update_evidence(ev_id, item.file_path, filed_at, renewal_date, owner_id)
-                    print(green("UPDATED"))
-                    updated += 1
+
+                    if _updated_today(existing.get("updatedAt")):
+                        print(yellow(
+                            f"  {dim('→')} Entry (ID {ev_id}) already has a version from "
+                            f"today — skipping to avoid a duplicate."
+                        ))
+                        skipped_already_done += 1
+                    else:
+                        print(
+                            f"  {dim('→')} Found entry (ID {ev_id}) — uploading new version... ",
+                            end="", flush=True,
+                        )
+                        client.update_evidence(ev_id, item.file_path, filed_at, renewal_date, owner_id)
+                        print(green("UPDATED"))
+                        updated += 1
 
                 else:
                     print(f"  {dim('→')} No existing entry — creating... ", end="", flush=True)
@@ -1109,6 +1154,8 @@ def main() -> None:
         print(f"  {dim('Months processed:')} {months_processed}")
     print(f"  {green('Created:')} {created}")
     print(f"  {cyan('Updated:')} {updated}")
+    if skipped_already_done:
+        print(f"  {dim('Skipped (already done today):')} {skipped_already_done}")
     print(f"  {(red if failed else dim)('Failed:')}  {failed}\n")
 
     if failed == 0:
