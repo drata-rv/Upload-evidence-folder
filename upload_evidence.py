@@ -192,18 +192,24 @@ class DrataClient:
         Fetches all evidence with controls expanded and matches entries where:
           1. cleaned_stem is a substring of the entry name (case-insensitive)
           2. The entry is linked to the expected control code (e.g. UAR-Synkros)
+
+        If more than one entry matches, the stem is too generic to disambiguate
+        safely (e.g. "Users" matching both "Remote Desktop Users" and "Recently
+        Disabled Users") — returns None so the caller creates a new entry
+        instead of silently attaching to the wrong one.
         """
         if not cleaned_stem or len(cleaned_stem) < 5:
             return None
-        for item in self._paginate(
-            f"{self._base}/evidence-library",
-            {"size": 200, "expand[]": "controls"},
-        ):
-            if cleaned_stem.lower() not in item.get("name", "").lower():
-                continue
-            if any(c.get("code") == control_code for c in item.get("controls", [])):
-                return item
-        return None
+        matches = [
+            item
+            for item in self._paginate(
+                f"{self._base}/evidence-library",
+                {"size": 200, "expand[]": "controls"},
+            )
+            if cleaned_stem.lower() in item.get("name", "").lower()
+            and any(c.get("code") == control_code for c in item.get("controls", []))
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def create_evidence(
         self,
@@ -947,7 +953,7 @@ def main() -> None:
         prompt_label = f"Upload these {total} document(s)?"
 
     confirm = input(f"\n{bold(prompt_label)} [Y/n]: ").strip().lower()
-    if confirm == "n":
+    if confirm not in ("y", ""):
         print("Aborted.")
         sys.exit(0)
 
